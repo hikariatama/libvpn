@@ -1,9 +1,13 @@
 import copy
 import json
+import pathlib
+import tempfile
 import unittest
+from unittest.mock import patch
 from fixtures import config, node
 import configuration as c
 from store import candidate
+import engine
 
 
 class ConfigurationTests(unittest.TestCase):
@@ -86,8 +90,9 @@ class ConfigurationTests(unittest.TestCase):
         result = candidate(value, {'action': 'reorder-groups', 'revision': 0, 'ids': ['second', 'custom']})
         self.assertEqual([g['id'] for g in result['groups']], ['second', 'custom'])
         with self.assertRaises(c.ConfigurationError): candidate(result, {'action': 'delete-group', 'revision': 0, 'id': 'custom'})
-        second = copy.deepcopy(second); second['snapshots'] = ['a' * 64]
-        with self.assertRaises(c.ConfigurationError): candidate(value, {'action': 'save-group', 'revision': 0, 'group': second})
+        second = copy.deepcopy(second); second['ruleSets'] = [{'kind': 'custom', 'name': 'Unknown', 'digest': 'a' * 64}]
+        with tempfile.TemporaryDirectory() as folder, patch.object(engine, 'ASSETS', pathlib.Path(folder)):
+            with self.assertRaises(c.ConfigurationError): candidate(value, {'action': 'save-group', 'revision': 0, 'group': second})
 
     def test_renamed_endpoint_invalidates_cached_resolution(self):
         value = config(); value['nodes'][0]['resolved'] = ['192.0.2.1']

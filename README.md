@@ -20,7 +20,7 @@
   </tbody>
 </table>
 
-CI replaces the draft for this version on rebuild. Before publication, maintainers can download it from [Releases](https://github.com/hikariatama/libvpn/releases). Checksums: `SHA256SUMS.txt`.
+Ordinary CI uploads unsigned build artifacts. The protected signed-release workflow prepares a version draft for owner review. Published versions and existing tags cannot be replaced. Release checksums: `SHA256SUMS.txt`.
 
 
 ## Prerequisites

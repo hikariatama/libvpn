@@ -20,6 +20,14 @@ class LocalizationTests(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertTrue(all(value and not re.search('[А-Яа-яЁё]', value) for value in localization.CATALOG.values()))
 
+    def test_every_interface_string_exists_in_both_catalogs(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        keys = {m for path in (root / 'Source').glob('*.swift') for m in re.findall(r'\bL\("((?:[^"\\]|\\.)*)"', path.read_text())}
+        self.assertGreater(len(keys), 100)
+        for language in ('en', 'ru'):
+            catalog = set(re.findall(r'^"((?:[^"\\]|\\.)*)" = ', (root / 'Resources' / (language + '.lproj') / 'Localizable.strings').read_text(), re.M))
+            self.assertEqual(sorted(keys - catalog), [], language)
+
     def test_only_fixed_error_text_is_translated_and_user_names_are_preserved(self):
         name = 'Мой сервер'
         self.assertEqual(localization.message('Сервер используется: ' + name, 'en'), 'Server is used by: ' + name)

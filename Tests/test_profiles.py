@@ -27,7 +27,7 @@ class ProfileTests(unittest.TestCase):
         digest = hashlib.sha256(blob).hexdigest()
         (root / (digest + '.srs')).write_bytes(blob)
         value['groups'] = [{'id': 'custom', 'title': 'Custom', 'flag': '', 'nodes': ['sample'],
-                            'enabled': True, 'domains': ['example.invalid'], 'snapshots': [digest]}]
+                            'enabled': True, 'domains': ['example.invalid'], 'ruleSets': [{'kind': 'custom', 'name': 'Synthetic', 'digest': digest}]}]
         return value
 
     def test_empty_and_full_profiles_round_trip_credentials_order_and_snapshots(self):
@@ -43,6 +43,32 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(set(blobs), profiles.references(imported))
                 self.assertEqual(digest, hashlib.sha256(base64.b64decode(encoded)).hexdigest())
                 self.assertNotIn('uuid', json.dumps(public(imported)))
+
+    def test_unsupported_compression_and_flags_are_rejected_before_decoding(self):
+        import struct
+        payload = json.dumps({'format': 'fennec-profile', 'version': 1, 'configuration': empty_configuration()})
+        for compression, flag in ((zipfile.ZIP_LZMA, 0), (zipfile.ZIP_BZIP2, 0),
+                                  (zipfile.ZIP_DEFLATED, 1), (zipfile.ZIP_DEFLATED, 0x20)):
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, 'w', compression) as archive:
+                archive.writestr('configuration.json', payload)
+            data = bytearray(output.getvalue())
+            if flag:
+                central = data.index(b'PK\x01\x02')
+                struct.pack_into('<H', data, 6, flag)
+                struct.pack_into('<H', data, central + 8, flag)
+            with patch.object(zipfile.ZipFile, 'open') as decoder, self.assertRaises(ConfigurationError):
+                profiles.unpack(base64.b64encode(data).decode(), 0)
+            decoder.assert_not_called()
+
+    def test_stored_and_deflated_profiles_remain_supported(self):
+        payload = json.dumps({'format': 'fennec-profile', 'version': 1, 'configuration': empty_configuration()})
+        for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, 'w', compression) as archive:
+                archive.writestr('configuration.json', payload)
+            value, _, _ = profiles.unpack(base64.b64encode(output.getvalue()).decode(), 1)
+            self.assertEqual(value['revision'], 1)
 
     def test_unexpected_paths_duplicates_corrupt_snapshots_and_zip_bombs_are_rejected(self):
         with tempfile.TemporaryDirectory() as folder:

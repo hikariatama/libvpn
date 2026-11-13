@@ -76,6 +76,9 @@ def validate_app(app, expected):
         raise ValueError('Application wordmark is missing')
     validate_private_runtime(app / 'Contents/Resources', expected['architecture'])
     resources = app / 'Contents/Resources'
+    payload = resources / 'HelperInstall.zip'
+    if not payload.is_file() or checksum(payload).encode() not in (app / 'Contents/MacOS/libvpn').read_bytes():
+        raise ValueError('Installation payload differs from the native pinned identity')
     package = resources / 'HelperUpdate'
     if package.exists():
         run([resources / 'PackageSignature', 'verify', resources / 'update-public-key.txt', package / 'manifest.json', package / 'signature.txt'])

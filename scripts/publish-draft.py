@@ -81,19 +81,38 @@ def publish(github, version, sha, files, *, ref='refs/heads/main', notes=''):
     elif ref != 'refs/tags/' + tag:
         raise ValueError('Releases can only be built from main or their matching version tag')
     existing = next((r for r in github.pages('/releases') if r['tag_name'] == tag), None)
-    draft = existing['draft'] if existing else True
+    if existing and existing.get('draft') is not True:
+        raise RuntimeError('Published releases are immutable; choose a new version')
+    draft = True
 
-    reference = '/git/refs/tags/' + tag
     tag_ref = github.request('GET', '/git/ref/tags/' + tag)
     if tag_ref:
-        github.request('PATCH', reference, {'sha': sha, 'force': True})
+        target = tag_ref['object']
+        # Annotated tags are immutable too; resolve them without moving the ref.
+        for _ in range(8):
+            if target.get('type') != 'tag':
+                break
+            target = github.request('GET', '/git/tags/' + target['sha'])['object']
+        if target.get('type') != 'commit' or target.get('sha') != sha:
+            raise RuntimeError('Version tag already identifies another commit; choose a new version')
     else:
         github.request('POST', '/git/refs', {'ref': 'refs/tags/' + tag, 'sha': sha})
     payload = {'tag_name': tag, 'target_commitish': sha, 'name': github.repository.rsplit('/', 1)[-1] + ' ' + tag, 'draft': draft, 'prerelease': False,
                'body': notes.strip()}
+    def require_draft(release_id):
+        current = github.request('GET', '/releases/' + str(release_id))
+        if not current or current.get('draft') is not True:
+            raise RuntimeError('Release is no longer a draft; refusing further mutations')
     if existing:
+        require_draft(existing['id'])
+        # Never send draft=true for an existing release: a concurrent owner
+        # publication must not be undone by this script.
+        payload.pop('draft')
         release = github.request('PATCH', '/releases/' + str(existing['id']), payload)
+        if not release or release.get('draft') is not True:
+            raise RuntimeError('Release is no longer a draft')
         for asset in github.pages('/releases/' + str(existing['id']) + '/assets'):
+            require_draft(existing['id'])
             github.request('DELETE', '/releases/assets/' + str(asset['id']))
     else:
         release = github.request('POST', '/releases', payload)
@@ -101,6 +120,7 @@ def publish(github, version, sha, files, *, ref='refs/heads/main', notes=''):
         raise RuntimeError('GitHub changed the release publication state')
     uploaded = []
     for name, path in sorted(files.items()):
+        require_draft(release['id'])
         url = release['upload_url'].split('{', 1)[0] + '?name=' + urllib.parse.quote(name)
         asset = github.request('POST', url, upload=path)
         digest = 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
@@ -115,12 +135,12 @@ def publish(github, version, sha, files, *, ref='refs/heads/main', notes=''):
 
 def main():
     root = Path(__file__).resolve().parents[1]
-    version = (root / 'VERSION').read_text().strip()
+    version = os.environ.get('RELEASE_VERSION') or (root / 'VERSION').read_text().strip()
     expected = [x['name'].replace('{version}', version) for x in json.loads((root / 'scripts/release-assets.json').read_text())]
     directory = Path(sys.argv[1] if len(sys.argv) > 1 else 'artifacts')
     files = collect_artifacts(directory, expected)
     github = GitHub(os.environ['GITHUB_REPOSITORY'], os.environ['GH_TOKEN'])
-    release, assets = publish(github, version, os.environ['GITHUB_SHA'], files, ref=os.environ['GITHUB_REF'], notes=(root / 'scripts/release-notes.md').read_text().strip())
+    release, assets = publish(github, version, os.environ.get('RELEASE_SHA', os.environ['GITHUB_SHA']), files, ref=os.environ.get('RELEASE_REF', os.environ['GITHUB_REF']), notes=(root / 'scripts/release-notes.md').read_text().strip())
     summary = os.environ.get('GITHUB_STEP_SUMMARY')
     if summary:
         with open(summary, 'a') as output:

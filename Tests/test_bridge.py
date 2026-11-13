@@ -19,8 +19,8 @@ class ProtocolTests(unittest.TestCase):
         status = patch.object(bridge.updates, 'STATUS', pathlib.Path(folder.name) / 'update-status.json'); status.start(); self.addCleanup(status.stop)
 
     def test_helper_readiness_waits_for_the_expected_build(self):
-        replies = [{'ok': True, 'version': 9}, {'ok': True, 'installed': True, 'version': 9, 'helperBuild': 'previous'},
-                   {'ok': True, 'installed': True, 'version': 9, 'helperBuild': 'expected'}]
+        replies = [{'ok': True, 'version': 10}, {'ok': True, 'installed': True, 'version': 10, 'helperBuild': 'previous'},
+                   {'ok': True, 'installed': True, 'version': 10, 'helperBuild': 'expected'}]
         with patch.object(bridge, 'client', side_effect=replies) as request, patch.object(bridge.time, 'sleep'):
             bridge.ready_helper('expected')
         self.assertEqual(request.call_count, 3)
@@ -36,6 +36,90 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError): protocol.read_frame(lambda _: b'x' * 10, 8)
         for request in ({'action': 'shell'}, {'action': 'status', 'path': '/tmp/x'}, {'action': 'set-kill-switch', 'revision': 0, 'enabled': 1}):
             with self.assertRaises(ConfigurationError): protocol.validate(request)
+
+    def test_ordinary_requests_cannot_use_the_update_allowance(self):
+        from unittest.mock import Mock
+        connection = Mock()
+        connection.recv.return_value = protocol.encode({'action': 'status', 'padding': 'x' * 256})
+        with patch.object(protocol, 'MAX_BYTES', 128), patch.object(bridge, 'peer_uid', return_value=501), patch.object(bridge, 'dispatch') as dispatch:
+            bridge.handle(connection, 501)
+        dispatch.assert_not_called()
+        self.assertEqual(connection.recv.call_args.args[0], 129)
+        self.assertFalse(json.loads(connection.sendall.call_args.args[0])['ok'])
+
+    def test_large_request_admission_bounds_action_length_and_concurrency(self):
+        from unittest.mock import Mock
+        body = protocol.encode({'action': 'store-rule-set', 'data': 'x' * 256})
+        header = protocol.encode({'action': 'store-rule-set', 'frameBytes': len(body), 'framing': 2})
+        first = Mock();first.recv.side_effect = [header, body]
+        second = Mock();second.recv.side_effect = [header, body]
+        budget = protocol.RequestBudget()
+        with patch.object(protocol, 'MAX_BYTES', 128), patch.object(protocol, 'TRANSFER_BYTES', 512):
+            with protocol.receive_request(first, budget) as request:
+                self.assertEqual(request['data'], 'x' * 256)
+                self.assertEqual(json.loads(first.sendall.call_args.args[0]), {'ready': True})
+                with self.assertRaises(ConfigurationError):
+                    with protocol.receive_request(second, budget):
+                        self.fail('Concurrent transfer was admitted')
+                self.assertEqual(second.recv.call_count, 1)
+                second.sendall.assert_not_called()
+            self.assertEqual(budget.bytes, 0)
+            self.assertFalse(budget.large)
+
+    def test_large_envelopes_reject_invalid_declarations_before_body(self):
+        from unittest.mock import Mock
+        for header in ({'action': 'status', 'frameBytes': 200, 'framing': 2},
+                       {'action': 'store-rule-set', 'frameBytes': 513, 'framing': 2},
+                       {'action': 'store-rule-set', 'frameBytes': True, 'framing': 2}):
+            connection = Mock();connection.recv.return_value = protocol.encode(header)
+            budget = protocol.RequestBudget()
+            with patch.object(protocol, 'MAX_BYTES', 128), patch.object(protocol, 'TRANSFER_BYTES', 512), self.assertRaises(ConfigurationError):
+                with protocol.receive_request(connection, budget): pass
+            self.assertEqual(connection.recv.call_count, 1)
+            connection.sendall.assert_not_called()
+            self.assertEqual(budget.bytes, 0)
+
+    def test_transfer_body_cannot_change_action_or_declared_length(self):
+        from unittest.mock import Mock
+        body = protocol.encode({'action': 'status', 'padding': 'x' * 256})
+        for size in (len(body), len(body) + 1):
+            connection = Mock();connection.recv.side_effect = [protocol.encode({'action': 'store-rule-set', 'frameBytes': size, 'framing': 2}), body]
+            budget = protocol.RequestBudget()
+            with patch.object(protocol, 'MAX_BYTES', 128), self.assertRaises(ConfigurationError):
+                with protocol.receive_request(connection, budget): pass
+            self.assertEqual(budget.bytes, 0)
+            self.assertFalse(budget.large)
+
+    def test_global_request_byte_budget_is_released_after_failure(self):
+        budget = protocol.RequestBudget()
+        with budget.reserve(protocol.UPDATE_BYTES):
+            with self.assertRaises(ConfigurationError):
+                with budget.reserve(8 * protocol.MAX_BYTES + 1): pass
+        self.assertEqual(budget.bytes, 0)
+
+    def test_client_negotiates_large_frames_and_retains_legacy_helper_support(self):
+        from unittest.mock import MagicMock
+        for framing in (None, 2):
+            status = MagicMock();status.__enter__.return_value = status
+            transfer = MagicMock();transfer.__enter__.return_value = transfer
+            status.recv.return_value = protocol.encode({'ok': True, 'version': 10, 'requestFraming': framing})
+            transfer.recv.side_effect = ([protocol.encode({'ready': True})] if framing else []) + [protocol.encode({'ok': True})]
+            request = {'action': 'store-rule-set', 'data': 'x' * 256, 'language': 'en'}
+            with patch.object(protocol, 'MAX_BYTES', 128), patch.object(bridge.socket, 'socket', side_effect=[status, transfer]):
+                self.assertTrue(bridge.client(request)['ok'])
+            sent = [json.loads(call.args[0]) for call in transfer.sendall.call_args_list]
+            self.assertEqual(sent[-1], request)
+            self.assertEqual(len(sent), 2 if framing else 1)
+            if framing:
+                self.assertEqual(sent[0]['frameBytes'], len(protocol.encode(request)))
+                self.assertEqual(sent[0]['language'], 'en')
+
+    def test_admission_errors_use_the_envelope_language(self):
+        from unittest.mock import Mock
+        connection = Mock();connection.recv.return_value = protocol.encode({'action': 'status', 'frameBytes': 300, 'framing': 2, 'language': 'en'})
+        with patch.object(bridge, 'peer_uid', return_value=501):
+            bridge.handle(connection, 501)
+        self.assertEqual(json.loads(connection.sendall.call_args.args[0])['error'], 'Invalid request')
 
     def test_status_has_no_private_endpoint_or_secret(self):
         with patch.object(engine, 'load_configuration', return_value=config()), patch.object(engine, 'read_state', return_value={'state': 'on'}):
@@ -58,7 +142,7 @@ class ProtocolTests(unittest.TestCase):
         from unittest.mock import MagicMock
         connection = MagicMock();connection.__enter__.return_value = connection
         connection.recv.side_effect = [protocol.encode({'ok': False, 'error': 'Unknown field'}),
-                                       protocol.encode({'ok': True, 'version': 9, 'helperBuild': 'legacy'})]
+                                       protocol.encode({'ok': True, 'version': 10, 'helperBuild': 'legacy'})]
         with patch.object(bridge.socket, 'socket', return_value=connection):
             result = bridge.client({'action': 'status', 'language': 'en'})
         requests = [json.loads(call.args[0]) for call in connection.sendall.call_args_list]

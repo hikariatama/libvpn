@@ -11,10 +11,11 @@ SHA = 'a' * 40
 
 
 class FakeGitHub:
-    def __init__(self, *, draft=True, sha=SHA, existing=True):
+    def __init__(self, *, draft=True, sha=SHA, existing=True, tag_sha=SHA):
         self.repository = 'hikariatama/libvpn'
         self.existing = existing
         self.sha = sha
+        self.tag_sha = tag_sha
         self.release = {'id': 1, 'tag_name': 'v0.0.1', 'draft': draft, 'upload_url': 'https://uploads.github.com/assets{?name}'}
         self.assets = [{'id': 2, 'name': 'stale-package.zip'}] if existing else []
         self.mutations = []
@@ -24,7 +25,11 @@ class FakeGitHub:
 
     def request(self, method, path, data=None, *, upload=None):
         if method == 'GET':
-            return {'object': {'sha': self.sha}}
+            if path == '/releases/1':
+                return self.release
+            if '/tags/' in path:
+                return {'object': {'sha': self.tag_sha, 'type': 'commit'}} if self.existing else None
+            return {'object': {'sha': self.sha, 'type': 'commit'}}
         self.mutations.append((method, path, data))
         if method == 'DELETE':
             self.assets = []
@@ -46,7 +51,7 @@ class DraftReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 release.collect_artifacts(Path(root), ['missing.zip'])
 
-    def test_draft_rebuild_retargets_tag_and_replaces_all_assets(self):
+    def test_draft_rebuild_keeps_tag_and_replaces_assets(self):
         github = FakeGitHub()
         with tempfile.TemporaryDirectory() as root:
             package = Path(root) / 'app.zip'
@@ -58,7 +63,7 @@ class DraftReleaseTests(unittest.TestCase):
         self.assertEqual(draft['name'], 'libvpn v0.0.1')
         self.assertEqual(draft['body'], notes)
         self.assertEqual({a['name'] for a in github.assets}, {'app.zip', 'SHA256SUMS.txt'})
-        self.assertIn(('PATCH', '/git/refs/tags/v0.0.1', {'sha': SHA, 'force': True}), github.mutations)
+        self.assertFalse(any(method == 'PATCH' and '/git/refs/' in path for method, path, _ in github.mutations))
         self.assertTrue(any(method == 'DELETE' for method, _, _ in github.mutations))
 
     def test_first_release_starts_as_draft(self):
@@ -72,18 +77,45 @@ class DraftReleaseTests(unittest.TestCase):
         self.assertTrue(any(method == 'POST' and path == '/releases' for method, path, _ in github.mutations))
         self.assertFalse(any(method == 'DELETE' for method, _, _ in github.mutations))
 
-    def test_published_rebuild_replaces_assets_without_unpublishing(self):
+    def test_published_release_is_rejected_before_any_mutation(self):
         github = FakeGitHub(draft=False)
-        with tempfile.TemporaryDirectory() as root:
-            package = Path(root) / 'app.zip'
-            package.write_bytes(b'rebuilt package')
-            files = release.collect_artifacts(Path(root), ['app.zip'])
-            current, uploaded = release.publish(github, '0.0.1', SHA, files)
-        self.assertFalse(current['draft'])
-        self.assertEqual(current['id'], 1)
-        self.assertEqual({a['name'] for a in github.assets}, {'app.zip', 'SHA256SUMS.txt'})
-        self.assertEqual(len(uploaded), 2)
-        self.assertIn(('PATCH', '/git/refs/tags/v0.0.1', {'sha': SHA, 'force': True}), github.mutations)
+        before = list(github.assets)
+        with self.assertRaisesRegex(RuntimeError, 'immutable'):
+            release.publish(github, '0.0.1', SHA, {})
+        self.assertEqual(github.mutations, [])
+        self.assertEqual(github.assets, before)
+
+    def test_existing_tag_cannot_be_moved_even_for_a_draft(self):
+        github = FakeGitHub(tag_sha='b' * 40)
+        with self.assertRaisesRegex(RuntimeError, 'another commit'):
+            release.publish(github, '0.0.1', SHA, {})
+        self.assertEqual(github.mutations, [])
+
+    def test_concurrent_publication_stops_before_asset_replacement(self):
+        github = FakeGitHub()
+        original = github.request
+        def request(method, path, data=None, **kwargs):
+            if method == 'GET' and path == '/releases/1':
+                github.release['draft'] = False
+            return original(method, path, data, **kwargs)
+        github.request = request
+        with self.assertRaisesRegex(RuntimeError, 'no longer a draft'):
+            release.publish(github, '0.0.1', SHA, {})
+        self.assertEqual(github.mutations, [])
+
+    def test_annotated_tag_must_resolve_to_the_requested_commit(self):
+        github = FakeGitHub()
+        original = github.request
+        def request(method, path, data=None, **kwargs):
+            if method == 'GET' and path == '/git/ref/tags/v0.0.1':
+                return {'object': {'type': 'tag', 'sha': 'c' * 40}}
+            if method == 'GET' and path == '/git/tags/' + 'c' * 40:
+                return {'object': {'type': 'commit', 'sha': 'b' * 40}}
+            return original(method, path, data, **kwargs)
+        github.request = request
+        with self.assertRaisesRegex(RuntimeError, 'another commit'):
+            release.publish(github, '0.0.1', SHA, {})
+        self.assertEqual(github.mutations, [])
 
     def test_stale_build_cannot_replace_current_draft(self):
         github = FakeGitHub(sha='b' * 40)

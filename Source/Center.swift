@@ -20,6 +20,28 @@ func bridgeRequest(_ request:[String:Any],completion:@escaping(Reply)->Void) {
   DispatchQueue.main.async { completion(reply) }
  }
 }
+enum SettingsPane:String,CaseIterable,Identifiable {
+ case routes,servers,tailnet,remote,general
+ var id:String { rawValue }
+ var title:String {
+  switch self {
+  case .routes:return L("Маршруты")
+  case .servers:return L("Серверы")
+  case .tailnet:return "Tailnet"
+  case .remote:return L("Удалённый доступ")
+  case .general:return L("Основные")
+  }
+ }
+ var symbol:String {
+  switch self {
+  case .routes:return "arrow.triangle.branch"
+  case .servers:return "server.rack"
+  case .tailnet:return "point.3.connected.trianglepath.dotted"
+  case .remote:return "iphone"
+  case .general:return "gearshape"
+  }
+ }
+}
 final class Center:ObservableObject {
  @Published var configuration=Configuration.empty
  @Published var installed=false
@@ -35,9 +57,17 @@ final class Center:ObservableObject {
  @Published var rxRate=0.0
  @Published var txRate=0.0
  @Published var profileImport:ProfileImport?
+ @Published var remoteState="off"
+ @Published var tailnetState="off"
+ @Published var settingsPane:SettingsPane?=SettingsPane(rawValue:UserDefaults.standard.string(forKey:"settingsPane") ?? "") ?? .routes
+ @Published var settingsItem:String?
  @Published var launchAtLogin=SMAppService.mainApp.status == .enabled
  let preview:Bool
  var visible=false
+ var settingsVisible=false
+ // The single-port tunnel is kept only for configurations that still use it.
+ var settingsPanes:[SettingsPane] { SettingsPane.allCases.filter{ $0 != .remote || configuration.remoteAccess != nil } }
+ var status:AppStatus { appStatus(installed:installed,needsUpdate:needsUpdate,state:state,configuration:configuration) }
  var openSettings:(()->Void)?
  private var checking=false
  private var trafficChecking=false
@@ -62,11 +92,29 @@ final class Center:ObservableObject {
       Server(id:"sample\(index)",name:L("Сервер {0} — длинное название узла", index+1),flag:"",country_code:code,address:"192.0.2.\(index+1)",port:443,tls:TLSInfo(server_name:"example.invalid"),hasUUID:true,hasPin:false)
      }
     }
-    var group=RouteGroup.empty();group.title=L("Рабочие сервисы");group.domains=["example.invalid"];group.nodes=Array(configuration.nodes.prefix(3)).map{$0.id};group.enabled=true
+    var group=RouteGroup.empty();group.id="sampleroute";group.title=L("Рабочие сервисы");group.domains=["example.invalid"]
+    group.ruleSets=[RuleSet(kind:"geosite",name:"category-example",digest:String(repeating:"0",count:64)),RuleSet(kind:"geoip",name:"de",digest:String(repeating:"1",count:64)),RuleSet(kind:"custom",name:"222222222222",digest:String(repeating:"2",count:64))]
+    group.nodes=Array(configuration.nodes.prefix(3)).map{$0.id};group.enabled=true
     configuration.groups=[group]
     paths=configuration.nodes.enumerated().map { index,node in Reachability(id:node.id,name:node.name,flag:node.symbol,success:true,latency:Double(12+index*7)) }
-    state="on";history=[1000,9000,3000,12000,5000,15000,8000]
+    configuration.fallback.nodes=[configuration.nodes[0].id];configuration.fallback.enabled=true
+    state="on";history=[1000,9000,3000,12000,5000,15000,8000];rxRate=412000;txRate=38000
+    if ProcessInfo.processInfo.arguments.contains("--preview-remote") {
+     configuration.remoteAccess=RemoteAccess(enabled:true,route:"fallback",localPort:3773,address:"vps.example.invalid",port:51820,serverPublicKey:String(repeating:"A",count:43)+"=",tunnelAddress:"10.77.0.2",peerAddress:"10.77.0.1",publicKey:String(repeating:"B",count:43)+"=")
+     remoteState="connected"
+    }
+    if ProcessInfo.processInfo.arguments.contains("--preview-tailnet") {
+     configuration.tailnet=Tailnet(enabled:true,route:"",controlURL:"https://headscale.example.invalid",hostname:"laptop",ephemeral:false,acceptRoutes:false,listenPort:41641,
+      services:[TailnetService(proto:"tcp",port:3773,localPort:3773),TailnetService(proto:"tcp",port:8080,localPort:31337)],hasAuthKey:true)
+     var privateRoute=RouteGroup.empty();privateRoute.id="privateroute";privateRoute.title=L("Закрытые сервисы");privateRoute.flag="🔒"
+     privateRoute.suffixes=["srv.example.invalid"];privateRoute.exit="tailnet";privateRoute.overrideAddress="100.64.0.3";privateRoute.enabled=true
+     configuration.groups.append(privateRoute)
+     tailnetState=ProcessInfo.processInfo.arguments.contains("--preview-tailnet-login") ? "login":"connected"
+    }
    }
+   if ProcessInfo.processInfo.arguments.contains("--preview-bypass") { configuration.bypass=true;state="bypass" }
+   if let pane=ProcessInfo.processInfo.arguments.first(where:{$0.hasPrefix("--preview-pane=")}) { settingsPane=SettingsPane(rawValue:String(pane.dropFirst(15))) }
+   if let item=ProcessInfo.processInfo.arguments.first(where:{$0.hasPrefix("--preview-item=")}) { settingsItem=String(item.dropFirst(15)) }
    if ProcessInfo.processInfo.arguments.contains("--preview-error") { state="error";if !configuration.groups.isEmpty { configuration.groups[0].killSwitch=true };error=L("Сервер недоступен. Защита сохраняется.") }
    if ProcessInfo.processInfo.arguments.contains("--preview-update") { needsUpdate=true }
    if ProcessInfo.processInfo.arguments.contains("--preview-updating") { needsUpdate=true;busy="install" }
@@ -79,7 +127,7 @@ final class Center:ObservableObject {
   helperUpdate.attemptedBuild=UserDefaults.standard.string(forKey:"helperUpdateAttemptedBuild")
   refresh()
   timer=Timer.scheduledTimer(withTimeInterval:3,repeats:true) { [weak self] _ in
-   guard let self,self.visible,self.busy == nil else { return };self.refresh()
+   guard let self,self.visible || self.settingsVisible,self.busy == nil else { return };self.refresh()
    if Date().timeIntervalSince(self.lastProbe)>10 { self.refreshMetrics() }
   }
   trafficTimer=Timer.scheduledTimer(withTimeInterval:0.8,repeats:true) { [weak self] _ in
@@ -94,7 +142,7 @@ final class Center:ObservableObject {
   bridgeRequest(["action":"status"]) { [weak self] reply in
    guard let self else { return };self.checking=false
    self.installed=reply.installed ?? false;self.needsUpdate=(reply.requiresUpdate ?? false) || (reply.ok && self.installed && reply.helperBuild != self.helperBuild);self.state=reply.state ?? "off"
-   self.recoveryRequired=reply.recoveryRequired ?? false
+   self.recoveryRequired=reply.recoveryRequired ?? false;self.remoteState=reply.remoteState ?? "off";self.tailnetState=reply.tailnetState ?? "off"
    if let value=reply.configuration { self.configuration=value }
    self.error=self.needsUpdate ? (self.helperUpdateError ?? reply.error):reply.error
    if reply.updateState == "updating" {
@@ -156,6 +204,14 @@ final class Center:ObservableObject {
    self.refresh()
   }
  }
+ func prepareRuleSet(_ source:[String:Any],completion:@escaping(Reply)->Void) {
+  if preview { completion(Reply(ok:false,error:L("Preview: применение системных изменений отключено")));return }
+  bridgeRequest(["action":"prepare-rule-set","source":source],completion:completion)
+ }
+ func inspectRuleSet(_ digest:String,completion:@escaping(Reply)->Void) {
+  if preview { completion(Reply(ok:false,error:L("Preview: применение системных изменений отключено")));return }
+  bridgeRequest(["action":"inspect-rule-set","digest":digest],completion:completion)
+ }
  func toggle(_ group:RouteGroup) {
   mutate(["action":"set-enabled","revision":configuration.revision,"id":group.id,"enabled":!group.enabled])
  }
@@ -166,6 +222,17 @@ final class Center:ObservableObject {
   mutate(["action":"set-bypass","revision":configuration.revision,"enabled":!configuration.bypassed])
  }
  func editChain(_ group:RouteGroup) { editingChain=group }
+ func toggleRemote(completion:@escaping()->Void = {}) {
+  guard let remote=configuration.remoteAccess else { return }
+  mutate(["action":"set-remote-access","revision":configuration.revision,"enabled":!remote.enabled]) { _ in completion() }
+ }
+ func toggleTailnet(completion:@escaping()->Void = {}) {
+  guard let tailnet=configuration.tailnet else { return }
+  mutate(["action":"set-tailnet","revision":configuration.revision,"enabled":!tailnet.enabled]) { _ in completion() }
+ }
+ func open(_ pane:SettingsPane,item:String?=nil) {
+  settingsPane=pane;settingsItem=item;openSettings?()
+ }
 
  func refreshMetrics() {
   guard !preview,installed,!needsUpdate,!probing else { return };probing=true;lastProbe=Date()

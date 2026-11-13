@@ -1,0 +1,18 @@
+title = "libvpn secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "vless-credential"
+description = "VLESS credential embedded in a connection URI"
+regex = '''(?i)vless://([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})@'''
+secretGroup = 1
+keywords = ["vless://"]
+
+[[rules.allowlists]]
+description = "Known synthetic VLESS identity in tests only"
+condition = "AND"
+paths = ['''(^|/)Tests/''']
+regexTarget = "secret"
+regexes = ['''^00000000-0000-4000-8000-000000000001$''']

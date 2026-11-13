@@ -1,26 +1,35 @@
 import Cocoa
 import SwiftUI
+import Combine
 
-final class Delegate:NSObject,NSApplicationDelegate,NSPopoverDelegate {
+final class Delegate:NSObject,NSApplicationDelegate,NSPopoverDelegate,NSWindowDelegate {
  var item:NSStatusItem!
  let popover=NSPopover()
  var model:Center!
  var settings:NSWindow?
+ private var iconStatus:MenuBarStatus?
+ private var observer:AnyCancellable?
  func applicationDidFinishLaunching(_ notification:Notification) {
   NSApp.setActivationPolicy(.accessory)
   configureMenus()
   model=Center();model.openSettings={ [weak self] in self?.showSettings() }
-  if model.preview { NSApp.appearance=NSAppearance(named:.darkAqua) }
+  if model.preview { NSApp.appearance=NSAppearance(named:ProcessInfo.processInfo.arguments.contains("--preview-light") ? .aqua:.darkAqua) }
   let host=NSHostingController(rootView:PopoverContent(model:model));host.sizingOptions=[.preferredContentSize]
   popover.contentViewController=host;popover.delegate=self;popover.behavior = .transient
   item=NSStatusBar.system.statusItem(withLength:28)
-  item.button?.image=menuBarImage(size:20)
   item.button?.toolTip=L("libvpn — маршрутизация");item.button?.setAccessibilityLabel(L("libvpn — маршрутизация"))
   item.button?.target=self;item.button?.action=#selector(toggle)
+  updateIcon()
+  observer=model.objectWillChange.receive(on:RunLoop.main).sink { [weak self] _ in self?.updateIcon() }
   DispatchQueue.main.asyncAfter(deadline:.now()+0.5) {
    if self.model.preview && ProcessInfo.processInfo.arguments.contains("--preview-settings") { self.showSettings() }
    else { self.toggle() }
   }
+ }
+ func updateIcon() {
+  let status=menuBarStatus(model.status)
+  guard status != iconStatus else { return }
+  iconStatus=status;item.button?.image=menuBarImage(size:20,status:status)
  }
  func configureMenus() {
   let main=NSMenu()
@@ -44,14 +53,17 @@ final class Delegate:NSObject,NSApplicationDelegate,NSPopoverDelegate {
  @objc func showSettings() {
   popover.performClose(nil)
   if settings == nil {
-   let window=NSWindow(contentRect:NSRect(x:0,y:0,width:520,height:300),styleMask:[.titled,.closable],backing:.buffered,defer:false)
-   window.title=L("Настройки libvpn");window.isReleasedWhenClosed=false
-   window.toolbarStyle = .preference
-   window.contentViewController=SettingsController(model:model)
-   window.center();settings=window
+   let window=NSWindow(contentRect:NSRect(x:0,y:0,width:860,height:580),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
+   window.title=L("Настройки libvpn");window.isReleasedWhenClosed=false;window.delegate=self
+   window.minSize=NSSize(width:760,height:480)
+   let host=NSHostingController(rootView:SettingsRoot(model:model));host.sizingOptions=[]
+   window.contentViewController=host
+   window.setContentSize(NSSize(width:860,height:580));window.center();settings=window
   }
+  model.settingsVisible=true;model.refresh()
   settings?.makeKeyAndOrderFront(nil);NSApp.activate(ignoringOtherApps:true)
  }
+ func windowWillClose(_ notification:Notification) { model.settingsVisible=false }
  func applicationShouldHandleReopen(_ sender:NSApplication,hasVisibleWindows flag:Bool)->Bool { if !popover.isShown { toggle() };return true }
  func popoverDidClose(_ notification:Notification) { model.visible=false }
  @objc func toggle() {
@@ -60,6 +72,12 @@ final class Delegate:NSObject,NSApplicationDelegate,NSPopoverDelegate {
    model.visible=true;model.refresh();model.refreshMetrics()
    popover.show(relativeTo:button.bounds,of:button,preferredEdge:.minY)
    NSApp.activate(ignoringOtherApps:true);popover.contentViewController?.view.window?.makeKey()
+   // macOS can hide a status item entirely; the app must still open something visible.
+   DispatchQueue.main.async {
+    if button.window?.isVisible != true || self.popover.contentViewController?.view.window?.isVisible != true {
+     self.popover.performClose(nil);self.showSettings()
+    }
+   }
   }
  }
 }

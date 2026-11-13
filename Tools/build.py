@@ -13,10 +13,10 @@ import tempfile
 import time
 from distribution import ARTWORK, OUTPUT, ROOT, metadata, record, run, validate_app
 from fetch_python import prepare as prepare_python
-from helper_package import create as create_helper_package
+from helper_package import create as create_helper_package, pack as pack_helper
 
 
-def build(app_only=False):
+def build(app_only=False, unsigned=False):
     if sys.platform != 'darwin':
         raise SystemExit('libvpn requires macOS and Apple Command Line Tools.')
     os.chdir(ROOT)
@@ -39,8 +39,6 @@ def build(app_only=False):
         prepare_python(ROOT / 'work/python-runtime', resources / 'Python')
         target = value['architecture'] + '-apple-macos' + value['minimumMacOS']
         sources = sorted(str(p.relative_to(ROOT)) for p in (ROOT / 'Source').glob('*.swift'))
-        run(['xcrun', 'swiftc', '-O', '-swift-version', '5', '-target', target] + sources +
-            ['-o', binary / 'libvpn', '-framework', 'Cocoa', '-framework', 'SwiftUI', '-framework', 'ServiceManagement'])
         run(['xcrun', 'swiftc', '-O', '-parse-as-library', '-target', target, 'Tools/PackageSignature.swift', '-o', resources / 'PackageSignature'])
         helper_digest = hashlib.sha256()
         for source in sorted((ROOT / 'Resources').glob('*.py')):
@@ -72,14 +70,21 @@ def build(app_only=False):
         run(['/usr/bin/codesign', '--force', '--sign', '-', resources / 'Python/bin/python3'])
         run(['/usr/bin/codesign', '--force', '--sign', '-', resources / 'sing-box'])
         run(['/usr/bin/codesign', '--force', '--sign', '-', resources / 'PackageSignature'])
-        private_key = os.environ.get('FENNEC_SIGNING_KEY_FILE')
+        private_key = None if unsigned else os.environ.get('FENNEC_SIGNING_KEY_FILE')
         if private_key:
             create_helper_package(resources, private_key, resources / 'HelperUpdate')
-        elif not os.environ.get('CI'):
+        elif not unsigned and not os.environ.get('CI'):
             local_key = pathlib.Path.home() / '.config/fennec/signing/release.key'
             if local_key.is_file(): create_helper_package(resources, local_key, resources / 'HelperUpdate')
-        elif os.environ.get('GITHUB_REF', '').startswith('refs/tags/'):
+        elif not unsigned and os.environ.get('GITHUB_REF', '').startswith('refs/tags/'):
             raise SystemExit('A signed release requires FENNEC_SIGNING_KEY_FILE')
+        # The running native executable pins the exact installation payload. No
+        # code from a mutable bundle runs with root privileges before this check.
+        payload_digest = pack_helper(resources, resources / 'HelperInstall.zip')
+        installer_identity = stage / 'InstallerIdentity.swift'
+        installer_identity.write_text('let helperInstallDigest = "' + payload_digest + '"\n')
+        run(['xcrun', 'swiftc', '-O', '-swift-version', '5', '-D', 'FENNEC_INSTALL_PAYLOAD', '-target', target] + sources +
+            [installer_identity, '-o', binary / 'libvpn', '-framework', 'Cocoa', '-framework', 'SwiftUI', '-framework', 'ServiceManagement'])
         run(['/usr/bin/codesign', '--force', '--sign', '-', app])
         validate_app(app, value)
         archive = stage / (value['stem'] + '.zip')
@@ -106,9 +111,10 @@ def build(app_only=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--app-only', action='store_true', help='Build the app and ZIP without installing DMG build dependencies')
+    parser.add_argument('--unsigned', action='store_true', help='Do not read a release key or create a signed helper update')
     args = parser.parse_args()
     try:
-        build(args.app_only)
+        build(args.app_only, args.unsigned)
     except subprocess.CalledProcessError as error:
         if error.stderr:
             print(error.stderr.decode(errors='replace') if isinstance(error.stderr, bytes) else error.stderr, file=sys.stderr)

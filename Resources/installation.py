@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import time
 import engine
+import profiles
 from configuration import empty_configuration, normalize, require
 from runtime_support import command as runtime_command
 from release import helper_build
@@ -36,15 +37,10 @@ def ensure_pf_anchor():
     lines.insert(index, marker)
     lines.append('load anchor "local.fennec.vpn" from "/etc/pf.anchors/local.fennec.vpn"')
     candidate = '\n'.join(lines) + '\n'
-    fd, name = tempfile.mkstemp(prefix='fennec-pf.', dir='/private/tmp')
-    try:
-        with os.fdopen(fd, 'w') as output:
-            output.write(candidate)
-        require(engine.run(['/sbin/pfctl', '-n', '-f', name]).returncode == 0, 'PF configuration rejected')
-        path.write_text(candidate); path.chmod(0o644)
-        require(engine.run(['/sbin/pfctl', '-f', path]).returncode == 0, 'PF configuration failed')
-    finally:
-        pathlib.Path(name).unlink(missing_ok=True)
+    def validate(staged):
+        require(engine.run(['/sbin/pfctl', '-n', '-f', staged]).returncode == 0, 'PF configuration rejected')
+    engine.atomic_file(path, candidate.encode(), mode=0o644, validate=validate)
+    require(engine.run(['/sbin/pfctl', '-f', path]).returncode == 0, 'PF configuration failed')
 
 
 def execute(uid):
@@ -67,9 +63,9 @@ def install(uid, initial_profile=None):
         if journal.exists():
             pending = json.loads(journal.read_text())
             config = normalize(pending['old'])
-        for group in config['groups']:
-            for digest in group.get('snapshots', []):
-                assets[digest] = (engine.ASSETS / (digest + '.srs')).read_bytes()
+        # The loaded configuration is already migrated, so v9 snapshots appear as ruleSets here.
+        for digest in profiles.references(config):
+            assets[digest] = (engine.ASSETS / (digest + '.srs')).read_bytes()
     elif initial_profile is not None:
         config, assets = initial_profile
         config = normalize(config)
@@ -100,6 +96,16 @@ def install(uid, initial_profile=None):
             require(hashlib.sha256(data).hexdigest() == digest, 'Rule snapshot checksum mismatch')
             (base / 'assets' / (digest + '.srs')).write_bytes(data)
             (base / 'assets' / (digest + '.srs')).chmod(0o600)
+        # The tailnet node identity exists only here. Rebuilding the engine without it logs
+        # the device out, and the stored one-time key cannot log it back in. Carry over the
+        # configured identity only; links are skipped, never followed.
+        state_id = config.get('tailnet', {}).get('stateId', '')
+        current = engine.TAILNET_DIR / state_id
+        if (re.fullmatch(r'[0-9a-f]{16}', state_id or '') and not engine.TAILNET_DIR.is_symlink()
+                and current.is_dir() and not current.is_symlink()):
+            (base / 'tailnet').mkdir(mode=0o700)
+            shutil.copytree(current, base / 'tailnet' / state_id, symlinks=True,
+                            ignore=lambda folder, names: [n for n in names if (pathlib.Path(folder) / n).is_symlink()])
         shutil.copy2(RESOURCE_DIR / 'sing-box', base / 'sing-box')
         (base / 'sing-box').chmod(0o755)
         secret = secrets.token_hex(24)
@@ -142,7 +148,7 @@ def install(uid, initial_profile=None):
             for path in engine.HOME.rglob('*'):
                 os.chown(path, 0, 0)
             engine.PF_FILE.parent.mkdir(parents=True, exist_ok=True)
-            engine.PF_FILE.write_text(engine.build_pf_rules(protection)); engine.PF_FILE.chmod(0o600)
+            engine.write_pf_anchor(engine.build_pf_rules(protection).encode())
             ensure_pf_anchor()
             engine.apply_kill_switch(protection, flush=engine.protected(protection))
             for label, role, extra in (('local.fennec.engine', 'engine', []), ('local.fennec.helper', 'bridge', ['daemon', str(uid)])):
@@ -171,9 +177,14 @@ def install(uid, initial_profile=None):
                     shutil.rmtree(engine.HOME)
                 if existed:
                     shutil.copytree(backup / 'Home', engine.HOME)
-                pf_conf.write_bytes(old_pf)
-                engine.PF_FILE.write_bytes(old_anchor)
-                engine.run(['/sbin/pfctl', '-f', pf_conf])
+                engine.write_pf_anchor(old_anchor)
+                def validate_pf(path):
+                    require(engine.run(['/sbin/pfctl', '-n', '-f', path]).returncode == 0, 'Restored PF configuration rejected')
+                engine.atomic_file(pf_conf, old_pf, mode=0o644, validate=validate_pf)
+                if engine.run(['/sbin/pfctl', '-f', pf_conf]).returncode != 0:
+                    if engine.protected(protection):
+                        engine.apply_kill_switch(protection, flush=True)
+                    raise RuntimeError('Restored PF configuration failed; protection retained')
                 for label in LABELS:
                     path = PLISTS / (label + '.plist')
                     if label in saved_plists:

@@ -2,15 +2,55 @@
 import copy
 import json
 import pathlib
-from configuration import ConfigurationError, import_vless, node, normalize, require
+import secrets
+from configuration import ConfigurationError, import_vless, node, normalize, require, rule_set
 import engine
+import profiles
 
 
 class RecoveryError(ConfigurationError):
     pass
 
 
-def candidate(current, request):
+def remote_candidate(current, raw, generate_keys):
+    require(isinstance(raw, dict) and set(raw) == {'enabled', 'address', 'port', 'serverPublicKey', 'tunnelAddress', 'peerAddress', 'localPort', 'route', 'rotateKeys'},
+            'Некорректные настройки удалённого доступа')
+    require(type(raw['rotateKeys']) is bool, 'Некорректные настройки удалённого доступа')
+    old = current.get('remoteAccess')
+    result = {k: v for k, v in raw.items() if k != 'rotateKeys'}
+    if old and not raw['rotateKeys']:
+        result.update(privateKey=old['privateKey'], publicKey=old['publicKey'])
+    else:
+        require(generate_keys is not None, 'Не удалось создать ключи WireGuard')
+        result['privateKey'], result['publicKey'] = generate_keys()
+    if old and old['address'] == raw['address']:
+        result['resolved'] = old.get('resolved', [])
+    return result
+
+
+def tailnet_candidate(current, raw):
+    editable = {'enabled', 'controlURL', 'hostname', 'authKey', 'ephemeral', 'acceptRoutes', 'route', 'listenPort', 'services', 'resetLogin'}
+    require(isinstance(raw, dict) and not set(raw) - editable and not (editable - {'authKey'}) - set(raw), 'Некорректные настройки tailnet')
+    require(type(raw['resetLogin']) is bool, 'Некорректные настройки tailnet')
+    old = current.get('tailnet')
+    result = {k: v for k, v in raw.items() if k != 'resetLogin'}
+    # The key is write-only: omitting it keeps the stored one, an empty string clears it.
+    if 'authKey' not in raw:
+        result['authKey'] = old['authKey'] if old else ''
+    # A new state directory starts a new node identity; the old one is pruned after commit.
+    same = old and old['controlURL'] == raw['controlURL'] and not raw['resetLogin']
+    result['stateId'] = old['stateId'] if same else secrets.token_hex(8)
+    if old and old['controlURL'] == raw['controlURL']:
+        result['resolved'] = old.get('resolved', [])
+    return result
+
+
+def stored_rule_set(digest):
+    path = engine.ASSETS / (digest + '.srs')
+    return not path.is_symlink() and path.is_file()
+
+
+def candidate(current, request, generate_keys=None):
     require(request['revision'] == current['revision'], 'Настройки изменились. Обновите данные перед сохранением.')
     result = copy.deepcopy(current)
     action = request['action']
@@ -60,8 +100,6 @@ def candidate(current, request):
         if group.get('id') == 'fallback':
             result['fallback'] = group
         else:
-            # Snapshots may only be retained from an existing group, never named by a caller.
-            require(set(group.get('snapshots', [])) <= set((existing or {}).get('snapshots', [])), 'Неизвестный снимок правил')
             if existing:
                 result['groups'] = [group if v['id'] == group['id'] else v for v in result['groups']]
             else:
@@ -86,10 +124,41 @@ def candidate(current, request):
             group['enabled' if action == 'set-enabled' else 'killSwitch'] = request['enabled']
     elif action == 'set-bypass':
         result['bypass'] = request['enabled']
+    elif action == 'save-remote-access':
+        result['remoteAccess'] = remote_candidate(current, request['remote'], generate_keys)
+    elif action == 'set-remote-access':
+        require('remoteAccess' in result, 'Удалённый доступ не настроен')
+        result['remoteAccess']['enabled'] = request['enabled']
+    elif action == 'delete-remote-access':
+        require('remoteAccess' in result, 'Удалённый доступ не настроен')
+        del result['remoteAccess']
+    elif action == 'save-tailnet':
+        result['tailnet'] = tailnet_candidate(current, request['tailnet'])
+    elif action == 'set-tailnet':
+        require('tailnet' in result, 'Tailnet не настроен')
+        result['tailnet']['enabled'] = request['enabled']
+    elif action == 'delete-tailnet':
+        require('tailnet' in result, 'Tailnet не настроен')
+        require(not any(g.get('exit') == 'tailnet' for g in result['groups']), 'Сначала переключите маршруты, которые выходят через tailnet')
+        del result['tailnet']
+    elif action == 'update-rule-sets':
+        updates = request['updates']
+        require(isinstance(updates, list) and len(updates) <= 1024, 'Некорректный набор правил')
+        lookup = {}
+        for raw in map(rule_set, updates):
+            require(raw['kind'] != 'custom' or 'url' in raw, 'Некорректный набор правил')
+            lookup[(raw['kind'], raw['name'], raw.get('url'))] = raw['digest']
+        for group in result['groups']:
+            for item in group.get('ruleSets', []):
+                item['digest'] = lookup.get((item['kind'], item['name'], item.get('url')), item['digest'])
     else:
         raise ConfigurationError('Неизвестное изменение конфигурации')
     result['revision'] += 1
-    return normalize(result)
+    result = normalize(result)
+    # A digest names only a file the helper validated and stored, never a caller-chosen path.
+    added = profiles.references(result) - profiles.references(normalize(current))
+    require(all(stored_rule_set(digest) for digest in added), 'Набор правил недоступен')
+    return result
 
 
 class Transaction:

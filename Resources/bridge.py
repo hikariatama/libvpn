@@ -13,6 +13,7 @@ import engine
 import metrics
 import protocol
 import profiles
+import rulesets
 import updates
 import localization
 from release import helper_build
@@ -23,13 +24,31 @@ SOCK = '/var/run/local.fennec.sock'
 ENGINE_SERVICE = 'system/local.fennec.engine'
 operation_lock = threading.Lock()
 failed_recovery = None
+remote_probe = {'revision': None, 'connected': False}
+tailnet_probe = {'revision': None, 'connected': False}
+request_budget = protocol.RequestBudget()
 
 
 def client(request):
     try:
+        data = protocol.encode(request)
+        framing = None
+        if len(data) > protocol.MAX_BYTES:
+            # Old helpers still accept their legacy large JSON frame. New helpers
+            # advertise admission control without changing the configuration schema.
+            framing = client({'action': 'status'}).get('requestFraming')
         with socket.socket(socket.AF_UNIX) as connection:
             connection.settimeout(180)
-            connection.connect(SOCK); connection.sendall(protocol.encode(request))
+            # Older helpers rescan their whole buffer per receive; a large send buffer keeps big frames within their deadline.
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+            connection.connect(SOCK)
+            if framing == protocol.FRAMING_VERSION:
+                connection.sendall(protocol.encode({'action': request['action'], 'frameBytes': len(data), 'framing': framing,
+                                                    'language': request.get('language', 'ru')}))
+                admission = protocol.read_frame(connection.recv)
+                if admission != {'ready': True}:
+                    return admission
+            connection.sendall(data)
             reply = protocol.read_frame(connection.recv, protocol.TRANSFER_BYTES)
             if request['action'] == 'status':
                 if not reply.get('ok') and 'language' in request:
@@ -37,7 +56,9 @@ def client(request):
                     # Only the read-only handshake may drop it for compatibility.
                     return client({key: value for key, value in request.items() if key != 'language'})
                 if reply.get('ok') and reply.get('version') != VERSION:
-                    return {'ok': True, 'installed': True, 'requiresUpdate': True, 'state': 'off'}
+                    # Keep the capability: a schema bump must not force an administrator prompt.
+                    return {'ok': True, 'installed': True, 'requiresUpdate': True, 'state': 'off', 'signedUpdates': reply.get('signedUpdates') is True,
+                            'requestFraming': reply.get('requestFraming')}
                 reply['installed'] = True
                 reply['updateState'] = updates.state().get('state')
                 if reply['updateState'] == 'failed' and not reply.get('error'):
@@ -159,9 +180,41 @@ def recover_if_needed(retry=False):
         return str(error)
 
 
+def remote_state(config, state):
+    if not engine.remote_active(config):
+        return 'off'
+    if state.get('state') in ('error', 'blocked'):
+        return 'stopped'
+    connected = remote_probe['revision'] == config['revision'] and remote_probe['connected']
+    return 'connected' if connected else 'waiting'
+
+
+def tailnet_state(config, state):
+    if not engine.tailnet_active(config):
+        return 'off'
+    if state.get('state') in ('error', 'blocked'):
+        return 'stopped'
+    if tailnet_probe['revision'] == config['revision'] and tailnet_probe['connected']:
+        return 'connected'
+    if not config['tailnet']['authKey'] and not engine.tailnet_registered(config):
+        return 'login'
+    return 'waiting'
+
+
+def probe_remote_once():
+    with operation_lock:
+        config = engine.load_configuration()
+    running = engine.read_state().get('state') not in ('error', 'blocked')
+    connected = engine.remote_active(config) and running and engine.remote_reachable(config)
+    remote_probe.update(revision=config['revision'], connected=connected)
+    connected = engine.tailnet_active(config) and running and engine.tailnet_reachable(config)
+    tailnet_probe.update(revision=config['revision'], connected=connected)
+
+
 def dispatch(request):
     protocol.validate(request)
     action = request['action']
+    require(action not in protocol.BRIDGE_ACTIONS, 'Неизвестная операция или поля запроса')
     if action in ('metrics', 'traffic'):
         with operation_lock:
             current = engine.load_configuration()
@@ -173,7 +226,9 @@ def dispatch(request):
             state = engine.read_state()
             return {'ok': True, 'installed': True, 'version': VERSION, 'state': 'blocked' if recovery_error else state.get('state', 'off'),
                     'error': recovery_error or state.get('error'), 'recoveryRequired': bool(recovery_error),
-                    'configuration': public(current), 'helperBuild': helper_build(), 'signedUpdates': True}
+                    'configuration': public(current), 'helperBuild': helper_build(), 'signedUpdates': True,
+                    'requestFraming': protocol.FRAMING_VERSION,
+                    'remoteState': remote_state(current, state), 'tailnetState': tailnet_state(current, state)}
         if action == 'configuration':
             return {'ok': True, 'configuration': public(current, editing=True)}
         if action == 'export-profile':
@@ -181,6 +236,10 @@ def dispatch(request):
         if action == 'update-helper':
             return updates.prepare(request)
         require(not recovery_error, recovery_error)
+        if action == 'store-rule-set':
+            return {'ok': True, 'digest': rulesets.store(request['data'])}
+        if action == 'inspect-rule-set':
+            return {'ok': True, 'contents': rulesets.contents(request['digest'])}
         if action in ('preview-profile', 'import-profile'):
             require(request['revision'] == current['revision'], 'Настройки изменились. Откройте профиль заново.')
             new, blobs, digest = profiles.unpack(request['archive'], current['revision'] + 1)
@@ -204,6 +263,8 @@ def dispatch(request):
                 if not (engine.BASE / 'transaction.json').exists():
                     for path in created: path.unlink(missing_ok=True)
                 raise
+            rulesets.prune(new)
+            engine.prune_tailnet(new)
             diagnostic('import-profile')
             return {'ok': True, 'configuration': public(new, editing=True)}
         if action in ('reconnect', 'refresh-endpoints'):
@@ -214,9 +275,15 @@ def dispatch(request):
                     return {'ok': True, 'configuration': public(current, editing=True)}
             new['revision'] += 1
         else:
-            new = candidate(current, request)
+            new = candidate(current, request, engine.wireguard_keys)
+            if action == 'update-rule-sets' and new['groups'] == current['groups']:
+                return {'ok': True, 'configuration': public(current, editing=True)}
         engine.resolve_nodes(new, protected=engine.protected(current))
         transaction().apply(current, new)
+        if action in ('save-group', 'delete-group', 'update-rule-sets'):
+            rulesets.prune(new)
+        if action in ('save-tailnet', 'delete-tailnet'):
+            engine.prune_tailnet(new)
         diagnostic(action)
         return {'ok': True, 'configuration': public(new, editing=True)}
 
@@ -230,19 +297,23 @@ def peer_uid(connection):
 
 
 def handle(connection, uid):
-    request = {};reply = {}
+    request = {};reply = {};context = {}
     try:
         require(peer_uid(connection) in (0, uid), 'Недопустимый пользователь')
         connection.settimeout(3)
-        request = protocol.read_frame(connection.recv, protocol.UPDATE_BYTES)
-        connection.settimeout(180)
-        reply = dispatch(request)
+        with protocol.receive_request(connection, request_budget, context) as request:
+            connection.settimeout(180)
+            try:
+                reply = dispatch(request)
+            finally:
+                # Errors must release decoded data before another large admission too.
+                request = None
     except ConfigurationError as error:
         reply = {'ok': False, 'error': str(error)}
     except Exception:
         reply = {'ok': False, 'error': 'Операция не завершена. Предыдущие настройки сохранены.'}
     try:
-        language = request.get('language', 'ru') if isinstance(request, dict) else 'ru'
+        language = context.get('language', 'ru')
         connection.sendall(protocol.encode(localization.reply(reply, language)))
     except OSError:
         pass
@@ -270,7 +341,16 @@ def daemon(uid):
                         dispatch({'action': 'refresh-endpoints'})
                 except Exception:
                     diagnostic('endpoint-refresh-failed')
+        def probe():
+            while True:
+                time.sleep(5)
+                try:
+                    probe_remote_once()
+                except Exception:
+                    remote_probe.update(revision=None, connected=False)
+                    tailnet_probe.update(revision=None, connected=False)
         threading.Thread(target=refresh, daemon=True).start()
+        threading.Thread(target=probe, daemon=True).start()
         while True:
             connection, _ = server.accept()
             if not semaphore.acquire(blocking=False):
@@ -296,7 +376,13 @@ def main():
         if set(request) - {'language'} == {'action'} and request.get('action') == 'update-helper':
             request = dict(updates.bundled_request(), language=request.get('language', 'ru'))
         protocol.validate(request)
-        print(json.dumps(localization.reply(client(request), request.get('language', 'ru')), ensure_ascii=False))
+        if request['action'] == 'prepare-rule-set':
+            reply = rulesets.prepare(request['source'], client)
+        elif request['action'] == 'refresh-rule-sets':
+            reply = rulesets.refresh(client)
+        else:
+            reply = client(request)
+        print(json.dumps(localization.reply(reply, request.get('language', 'ru')), ensure_ascii=False))
     except Exception:
         print(json.dumps({'ok': False, 'error': 'Некорректный запрос'}))
 

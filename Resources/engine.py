@@ -8,6 +8,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -34,6 +35,19 @@ PF_LOCK = pathlib.Path('/var/run/local.fennec.pf.lock')
 OPERATION_LOCK = pathlib.Path('/var/run/local.fennec.operations.lock')
 PF_REFERENCE = pathlib.Path('/var/run/local.fennec.pf-reference.json')
 DNS_PROXY_PORT = 18100
+REMOTE_TAG = 'remote-access'
+REMOTE_MTU = 1280
+REMOTE_KEEPALIVE = 25
+REMOTE_PROBE_PORT = 9
+REMOTE_PROBE_SECONDS = 3
+TAILNET_TAG = 'tailnet'
+TAILNET_DNS = 'tailnet-dns'
+TAILNET_DIR = BASE / 'tailnet'
+TAILNET_CONTROL = 'https://controlplane.tailscale.com'
+TAILNET_PROBE = '100.100.100.100'
+# The embedded Tailscale client uploads node logs to log.tailscale.com unless this is set.
+ENGINE_ENVIRONMENT = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'TS_NO_LOGS_NO_SUPPORT': 'true'}
+DOMAIN_MATCHERS = (('domains', 'domain'), ('suffixes', 'domain_suffix'), ('keywords', 'domain_keyword'), ('regexes', 'domain_regex'))
 
 
 def run(args, input_text=None, timeout=30):
@@ -53,6 +67,33 @@ def atomic_json(path, value, mode=0o600):
         os.replace(name, path)
     finally:
         pathlib.Path(name).unlink(missing_ok=True)
+
+
+def atomic_file(path, data, mode=0o600, validate=None):
+    """Commit validated bytes durably without truncating the previous file."""
+    import tempfile
+    fd, name = tempfile.mkstemp(prefix='.' + path.name + '.', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'wb') as output:
+            os.fchmod(output.fileno(), mode)
+            output.write(data); output.flush(); os.fsync(output.fileno())
+        if validate:
+            validate(pathlib.Path(name))
+        os.replace(name, path)
+        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    finally:
+        pathlib.Path(name).unlink(missing_ok=True)
+
+
+def write_pf_anchor(data):
+    def validate(path):
+        require(run(['/sbin/pfctl', '-n', '-a', PF_ANCHOR, '-f', path]).returncode == 0,
+                'PF отклонил конфигурацию')
+    atomic_file(PF_FILE, data, validate=validate)
 
 
 def load_configuration():
@@ -114,8 +155,112 @@ def tunneled_lookup(name):
     return sorted({str(ipaddress.ip_address(v)) for v in values})
 
 
+def remote_active(config):
+    return bool(config.get('remoteAccess', {}).get('enabled', False))
+
+
+def tailnet_active(config):
+    return bool(config.get('tailnet', {}).get('enabled', False))
+
+
+def tailnet_state_directory(network):
+    return TAILNET_DIR / network['stateId']
+
+
+def tailnet_control(network):
+    parts = urllib.parse.urlsplit(network['controlURL'] or TAILNET_CONTROL)
+    return parts.hostname, parts.port or 443
+
+
+def tailnet_reachable(config):
+    """MagicDNS at 100.100.100.100 answers only after the node is logged in and has a network map."""
+    token = TOKEN.read_text().strip().encode()
+    query = struct.pack('!HHHHHH', 0x5a5a, 0x0100, 1, 0, 0, 0) + b'\x0dlibvpn-status\x07invalid\x00' + struct.pack('!HH', 1, 1)
+    try:
+        with socket.create_connection(('127.0.0.1', DNS_PROXY_PORT), timeout=REMOTE_PROBE_SECONDS) as proxy:
+            proxy.settimeout(REMOTE_PROBE_SECONDS)
+            proxy.sendall(b'\x05\x01\x02')
+            if recv_exact(proxy, 2) != b'\x05\x02':
+                return False
+            proxy.sendall(b'\x01\x04root' + bytes([len(token)]) + token)
+            if recv_exact(proxy, 2) != b'\x01\x00':
+                return False
+            proxy.sendall(b'\x05\x01\x00\x01' + ipaddress.ip_address(TAILNET_PROBE).packed + struct.pack('!H', 53))
+            head = recv_exact(proxy, 4)
+            if head[:2] != b'\x05\x00' or head[3] not in (1, 4):
+                return False
+            recv_exact(proxy, {1: 4, 4: 16}[head[3]] + 2)
+            proxy.sendall(struct.pack('!H', len(query)) + query)
+            size = struct.unpack('!H', recv_exact(proxy, 2))[0]
+            answer = recv_exact(proxy, size)
+            return size >= 12 and answer[:2] == b'\x5a\x5a' and answer[2] & 0x80 == 0x80
+    except (OSError, struct.error):
+        return False
+
+
+def tailnet_registered(config):
+    """Only checks that a node identity exists; the state file holds private keys and is never returned."""
+    try:
+        data = json.loads((tailnet_state_directory(config['tailnet']) / 'tailscaled.state').read_text())
+        return isinstance(data, dict) and bool(data.get('_current-profile'))
+    except (OSError, ValueError, KeyError):
+        return False
+
+
+def prune_tailnet(config):
+    """Delete node identities that the committed configuration no longer uses."""
+    if (BASE / 'transaction.json').exists() or not TAILNET_DIR.is_dir() or TAILNET_DIR.is_symlink():
+        return
+    keep = config.get('tailnet', {}).get('stateId')
+    for path in TAILNET_DIR.iterdir():
+        if path.name != keep and re.fullmatch(r'[0-9a-f]{16}', path.name) and path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def idle(config):
+    return config.get('bypass', False) or not any(g['enabled'] or g.get('killSwitch', False) for g in config['groups'] + [config['fallback']])
+
+
+def wireguard_keys():
+    result = run([BIN, 'generate', 'wg-keypair'])
+    private = re.search(r'^PrivateKey:\s*(\S+)\s*$', result.stdout, re.M)
+    public = re.search(r'^PublicKey:\s*(\S+)\s*$', result.stdout, re.M)
+    require(result.returncode == 0 and private and public, 'Не удалось создать ключи WireGuard')
+    return private.group(1), public.group(1)
+
+
+def remote_reachable(config):
+    """Proxy replies optimistically: a prompt close after it proves the peer answered; silence means no path."""
+    remote = config['remoteAccess']
+    token = TOKEN.read_text().strip().encode()
+    address = ipaddress.ip_address(remote['peerAddress'])
+    try:
+        with socket.create_connection(('127.0.0.1', DNS_PROXY_PORT), timeout=REMOTE_PROBE_SECONDS) as proxy:
+            proxy.settimeout(REMOTE_PROBE_SECONDS)
+            proxy.sendall(b'\x05\x01\x02')
+            if recv_exact(proxy, 2) != b'\x05\x02':
+                return False
+            proxy.sendall(b'\x01\x04root' + bytes([len(token)]) + token)
+            if recv_exact(proxy, 2) != b'\x01\x00':
+                return False
+            proxy.sendall(b'\x05\x01\x00' + (b'\x01' if address.version == 4 else b'\x04') + address.packed + struct.pack('!H', REMOTE_PROBE_PORT))
+            head = recv_exact(proxy, 4)
+            size = {1: 4, 4: 16}.get(head[3])
+            if head[:2] != b'\x05\x00' or size is None:
+                return head[:2] == b'\x05\x05'
+            recv_exact(proxy, size + 2)
+            try:
+                proxy.recv(1)
+            except socket.timeout:
+                return False
+            return True
+    except OSError:
+        return False
+
+
 def resolve_nodes(config, protected=False, refresh=False):
-    for node in config['nodes']:
+    remote = [config['remoteAccess']] if remote_active(config) else []
+    for node in config['nodes'] + remote:
         if literal(node['address']):
             node['resolved'] = [literal(node['address'])]
             continue
@@ -130,12 +275,55 @@ def resolve_nodes(config, protected=False, refresh=False):
             node['resolved'] = addresses
         except (OSError, ValueError, ssl.SSLError):
             raise ConfigurationError('Не удалось разрешить имя сервера. При включённой защите нужен работающий туннель; прямой DNS не используется.') from None
+    network = config.get('tailnet')
+    if network and network['enabled'] and not network['route'] and (refresh or not network.get('resolved')):
+        # Protection lets a direct control connection reach only these addresses.
+        host, port = tailnet_control(network)
+        try:
+            if literal(host):
+                network['resolved'] = [literal(host)]
+            elif protected:
+                network['resolved'] = tunneled_lookup(host)[:32]
+            else:
+                network['resolved'] = sorted({v[4][0] for v in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})[:32]
+        except (OSError, ValueError, ssl.SSLError, ConfigurationError):
+            network['resolved'] = network.get('resolved', [])
     return config
 
 
 def protected(config):
     return not config.get('bypass', False) and (config.get('killSwitch', False) or any(
         g.get('killSwitch', False) for g in config['groups'] + [config['fallback']]))
+
+
+def host_prefix(address):
+    return address + ('/128' if ':' in address else '/32')
+
+
+def remote_endpoint(remote, finals):
+    ips = endpoint_ips(remote)
+    require(bool(ips), 'Имя сервера ещё не разрешено')
+    endpoint = {'type': 'wireguard', 'tag': REMOTE_TAG, 'system': False, 'mtu': REMOTE_MTU,
+                'address': [host_prefix(remote['tunnelAddress'])], 'private_key': remote['privateKey'],
+                'peers': [{'address': ips[0], 'port': remote['port'], 'public_key': remote['serverPublicKey'],
+                           'allowed_ips': [host_prefix(remote['peerAddress'])], 'persistent_keepalive_interval': REMOTE_KEEPALIVE}]}
+    if remote['route']:
+        endpoint['detour'] = finals[remote['route']]
+    return endpoint
+
+
+def tailnet_endpoint(network, finals):
+    state = tailnet_state_directory(network)
+    # Received files default to a path relative to the working directory, which is `/` under launchd.
+    endpoint = {'type': 'tailscale', 'tag': TAILNET_TAG, 'state_directory': str(state), 'taildrop_directory': str(state / 'Taildrop'),
+                'ephemeral': network['ephemeral'], 'accept_routes': network['acceptRoutes'], 'listen_port': network['listenPort']}
+    for field, key in (('controlURL', 'control_url'), ('hostname', 'hostname'), ('authKey', 'auth_key')):
+        if network[field]:
+            endpoint[key] = network[field]
+    # Only the coordination server connection can use a chain; peer traffic is WireGuard over UDP.
+    if network['route']:
+        endpoint['detour'] = finals[network['route']]
+    return endpoint
 
 
 def build_runtime(config, assets=None, token='test-only-token'):
@@ -166,57 +354,110 @@ def build_runtime(config, assets=None, token='test-only-token'):
             outbounds.append(outbound)
             previous, previous_node = tag, node
         finals[group['id']] = previous
+    network = config['tailnet'] if tailnet_active(config) else None
+    for group in groups:
+        if group.get('exit') == 'tailnet':
+            finals[group['id']] = TAILNET_TAG if network else None
     def action(group):
         if config.get('bypass', False):
             return {'action': 'route', 'outbound': 'direct'}
-        if group['enabled']:
-            return {'action': 'route', 'outbound': finals[group['id']]}
+        if group['enabled'] and finals.get(group['id']):
+            result = {'action': 'route', 'outbound': finals[group['id']]}
+            if group.get('overrideAddress'):
+                result['override_address'] = group['overrideAddress']
+            return result
         if group.get('killSwitch', False):
             return {'action': 'reject', 'method': 'default'}
         return {'action': 'route', 'outbound': 'direct'}
     # DNS uses a configured chain even when the fallback is disabled.
-    dns_chain = next((finals[g['id']] for g in [config['fallback']] + config['groups'] if g['enabled'] and not config.get('bypass', False)), None)
-    rules = [{'action': 'sniff'}, {'protocol': 'dns', 'action': 'hijack-dns'}]
+    dns_chain = next((finals[g['id']] for g in [config['fallback']] + config['groups']
+                      if g['enabled'] and g.get('exit') != 'tailnet' and not config.get('bypass', False)), None)
+    rules = [{'action': 'sniff'}]
+    if network:
+        # A query sent to a private resolver behind the tailnet (a corporate DNS reached through
+        # an accepted subnet route, named in /etc/resolver) goes there unchanged; all other DNS
+        # is answered here. A LAN resolver never enters the tunnel, so it is not affected.
+        rules.append({'protocol': 'dns', 'ip_is_private': True, 'preferred_by': [TAILNET_TAG],
+                      'action': 'route', 'outbound': TAILNET_TAG})
+    rules.append({'protocol': 'dns', 'action': 'hijack-dns'})
     proxy_action = {'action': 'route', 'outbound': dns_chain} if dns_chain else {'action': 'reject'}
+    remote = config.get('remoteAccess') if remote_active(config) else None
+    if remote:
+        # Only the configured loopback port is reachable through the tunnel.
+        rules += [{'inbound': REMOTE_TAG, 'network': 'tcp', 'port': remote['localPort'], 'action': 'route', 'outbound': 'direct',
+                   'override_address': '127.0.0.1', 'override_port': remote['localPort']},
+                  {'inbound': REMOTE_TAG, 'action': 'reject'},
+                  {'inbound': 'endpoint-dns', 'ip_cidr': [host_prefix(remote['peerAddress'])], 'action': 'route', 'outbound': REMOTE_TAG}]
+    if network:
+        # The endpoint hands connections to its own address over as 127.0.0.1:<port>, so every
+        # port that is not listed must be refused or peers could reach any local service.
+        for service in network['services']:
+            rules.append({'inbound': TAILNET_TAG, 'network': service['protocol'], 'port': service['port'], 'action': 'route',
+                          'outbound': 'direct', 'override_address': '127.0.0.1', 'override_port': service['localPort']})
+        rules += [{'inbound': TAILNET_TAG, 'action': 'reject'},
+                  {'inbound': 'endpoint-dns', 'ip_cidr': [host_prefix(TAILNET_PROBE)], 'action': 'route', 'outbound': TAILNET_TAG}]
     rules.append({'inbound': 'endpoint-dns', **proxy_action})
     ips = sorted({ip for n in config['nodes'] for ip in endpoint_ips(n)})
     if ips:
         rules.append({'ip_cidr': ips, 'action': 'route', 'outbound': 'direct'})
+    if network:
+        # Peer addresses, accepted subnet routes and MagicDNS names always use the tailnet.
+        rules.append({'preferred_by': [TAILNET_TAG], 'action': 'route', 'outbound': TAILNET_TAG})
     rules.append({'ip_is_private': True, 'action': 'route', 'outbound': 'direct'})
     snapshots = set()
     for group in config['groups']:
-        for source, field in (('domains', 'domain'), ('suffixes', 'domain_suffix'), ('cidrs', 'ip_cidr'), ('snapshots', 'rule_set')):
+        for source, field in DOMAIN_MATCHERS + (('cidrs', 'ip_cidr'),):
             values = group.get(source, [])
             if values:
                 rules.append({field: values, **action(group)})
-            if source == 'snapshots':
-                snapshots.update(values)
+        digests = [item['digest'] for item in group.get('ruleSets', [])]
+        if digests:
+            rules.append({'rule_set': digests, **action(group)})
+            snapshots.update(digests)
     # Explicit final catch-all also supports reject without a deprecated block outbound.
     rules.append(action(config['fallback']))
     dns = {'type': 'https', 'tag': 'resolver', 'server': '1.1.1.1', 'server_port': 443,
            'tls': {'enabled': True, 'server_name': 'cloudflare-dns.com'}}
     if dns_chain:
         dns['detour'] = dns_chain
-    dns_rules = []
+    dns_rules = [{'preferred_by': [TAILNET_DNS], 'action': 'route', 'server': TAILNET_DNS}] if network else []
     if not config.get('bypass', False):
         for group in config['groups']:
             dns_action = {'action': 'reject'} if group.get('killSwitch', False) and not group['enabled'] else {'action': 'route', 'server': 'resolver'}
-            for source, field in (('domains', 'domain'), ('suffixes', 'domain_suffix'), ('snapshots', 'rule_set')):
+            for source, field in DOMAIN_MATCHERS:
                 if group.get(source):
                     dns_rules.append({field: group[source], **dns_action})
+            # GeoIP holds only addresses: a name cannot match it before resolution.
+            digests = [item['digest'] for item in group.get('ruleSets', []) if item['kind'] != 'geoip']
+            if digests:
+                dns_rules.append({'rule_set': digests, **dns_action})
         fallback = config['fallback']
         if fallback.get('killSwitch', False) and not fallback['enabled']:
             dns_rules.append({'action': 'reject'})
-    return {'log': {'disabled': True},
-            'dns': {'servers': [dns], 'rules': dns_rules, 'final': 'resolver', 'strategy': 'prefer_ipv4'},
-            'inbounds': [{'type': 'tun', 'tag': 'tun-in', 'address': ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'], 'mtu': 1400,
-                          'auto_route': True, 'strict_route': True, 'dns_mode': 'hijack'},
-                         {'type': 'mixed', 'tag': 'endpoint-dns', 'listen': '127.0.0.1', 'listen_port': DNS_PROXY_PORT,
-                          'users': [{'username': 'root', 'password': token}]}],
-            'outbounds': outbounds,
-            'route': {'auto_detect_interface': True, 'final': 'direct', 'rules': rules,
-                      'rule_set': [{'type': 'local', 'tag': digest, 'format': 'binary',
-                                    'path': str(assets / (digest + '.srs'))} for digest in sorted(snapshots)]}}
+    inbounds = [{'type': 'mixed', 'tag': 'endpoint-dns', 'listen': '127.0.0.1', 'listen_port': DNS_PROXY_PORT,
+                 'users': [{'username': 'root', 'password': token}]}]
+    # With no route to serve, remote access and the tailnet run without TUN so bypass stays truly direct.
+    if not ((remote or network) and idle(config)):
+        # gVisor terminates TCP inside sing-box. The default system stack hands it back
+        # to the macOS kernel, and with another VPN's utun already up (Tunnelblick) every
+        # TCP connection failed after an engine start while DNS still answered.
+        inbounds.insert(0, {'type': 'tun', 'tag': 'tun-in', 'address': ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'], 'mtu': 1400,
+                            'stack': 'gvisor', 'auto_route': True, 'strict_route': True, 'dns_mode': 'hijack'})
+    runtime = {'log': {'disabled': True},
+               'dns': {'servers': [dns], 'rules': dns_rules, 'final': 'resolver', 'strategy': 'prefer_ipv4'},
+               'inbounds': inbounds,
+               'outbounds': outbounds,
+               'route': {'auto_detect_interface': True, 'final': 'direct', 'rules': rules,
+                         'rule_set': [{'type': 'local', 'tag': digest, 'format': 'binary',
+                                       'path': str(assets / (digest + '.srs'))} for digest in sorted(snapshots)]}}
+    endpoints = [remote_endpoint(remote, finals)] if remote else []
+    if network:
+        endpoints.append(tailnet_endpoint(network, finals))
+        runtime['dns']['servers'].append({'type': 'tailscale', 'tag': TAILNET_DNS, 'endpoint': TAILNET_TAG})
+        runtime['route']['default_domain_resolver'] = 'resolver'
+    if endpoints:
+        runtime['endpoints'] = endpoints
+    return runtime
 
 
 def build_pf_rules(config, tunnel=None):
@@ -231,6 +472,14 @@ def build_pf_rules(config, tunnel=None):
             family = 'inet6' if ':' in ip else 'inet'
             lines.append(f'pass out quick {family} proto tcp to {ip} port {node["port"]} keep state')
             lines.append(f'pass out quick {family} proto {"icmp6" if family == "inet6" else "icmp"} to {ip} keep state')
+    if tailnet_active(config):
+        network = config['tailnet']
+        # WireGuard and STUN leave from the fixed tailnet port; relays over HTTPS stay blocked.
+        lines.append(f'pass out quick proto udp from any port {network["listenPort"]} keep state')
+        if not network['route']:
+            port = tailnet_control(network)[1]
+            for ip in network.get('resolved', []):
+                lines.append(f'pass out quick {"inet6" if ":" in ip else "inet"} proto tcp to {ip} port {port} keep state')
     # LAN exceptions must not turn a router's resolver into an external DNS bypass.
     lines += ['block drop out quick proto { tcp, udp } to any port { 53, 853 }',
               'pass out quick inet to { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 }',
@@ -288,7 +537,7 @@ def apply_kill_switch(config, tunnel=None, flush=False):
     with pf_lock():
         require(run(['/sbin/pfctl', '-n', '-a', PF_ANCHOR, '-f', '-'], rules).returncode == 0, 'PF отклонил конфигурацию')
         # Disk copy excludes ephemeral TUN names: boot starts with protection closed.
-        PF_FILE.write_text(build_pf_rules(config)); PF_FILE.chmod(0o600)
+        write_pf_anchor(build_pf_rules(config).encode())
         require(run(['/sbin/pfctl', '-a', PF_ANCHOR, '-f', '-'], rules).returncode == 0, 'Не удалось применить PF')
         if protected(config):
             ensure_pf_enabled()
@@ -346,21 +595,30 @@ def serve():
     signal.signal(signal.SIGINT, lambda *_: stopping.set())
     try:
         config = load_configuration(); revision = config['revision']
-        apply_kill_switch(effective_guard(config), flush=protected(config))
-        if config.get('bypass', False) or not any(g['enabled'] or g.get('killSwitch', False) for g in config['groups'] + [config['fallback']]):
+        guard = effective_guard(config)
+        apply_kill_switch(guard, flush=protected(guard))
+        idle_state = 'bypass' if config.get('bypass', False) else 'off'
+        tunless = idle(config)
+        if tunless and not (remote_active(config) or tailnet_active(config)):
             while not stopping.is_set():
-                publish('bypass' if config.get('bypass', False) else 'off', revision)
+                publish(idle_state, revision)
                 stopping.wait(1)
             return
+        if tailnet_active(config):
+            TAILNET_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
         runtime = build_runtime(config, token=TOKEN.read_text().strip())
         atomic_json(RUNTIME, runtime)
         require(run([BIN, 'check', '-c', RUNTIME]).returncode == 0, 'Конфигурация движка не прошла проверку')
         before = interfaces()
-        child = subprocess.Popen([str(BIN), 'run', '-c', str(RUNTIME)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child = subprocess.Popen([str(BIN), 'run', '-c', str(RUNTIME)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 cwd=str(BASE), env=ENGINE_ENVIRONMENT)
         tunnel = None
         deadline = time.monotonic() + 10
         while not stopping.wait(0.1):
             require(child.poll() is None, 'Сетевой движок завершился')
+            if tunless:
+                publish(idle_state, revision)
+                continue
             if not tunnel:
                 tunnel = own_tunnel(before)
                 if tunnel:
@@ -373,7 +631,8 @@ def serve():
     finally:
         if config:
             try:
-                apply_kill_switch(effective_guard(config))
+                guard = effective_guard(config)
+                apply_kill_switch(guard, flush=protected(guard))
             except Exception:
                 pass  # Never clear the existing anchor after a protection failure.
         if child and child.poll() is None:

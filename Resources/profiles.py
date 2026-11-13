@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import pathlib
+import secrets
 import zipfile
 from configuration import ConfigurationError, normalize, require
 
@@ -13,14 +14,18 @@ MAX_ASSET = 32 * 1024 * 1024
 
 
 def references(config):
-    return {digest for group in config['groups'] for digest in group.get('snapshots', [])}
+    return {item['digest'] for group in config['groups'] for item in group.get('ruleSets', [])}
 
 
 def pack(configuration, assets):
     config = normalize(configuration)
     config['revision'] = 0
-    for node in config['nodes']:
+    for node in config['nodes'] + ([config['remoteAccess']] if 'remoteAccess' in config else []):
         node.pop('resolved', None)
+    if 'tailnet' in config:
+        # A node identity lives in the helper's state directory and is never exported; neither is the auth key.
+        for field in ('authKey', 'stateId', 'resolved'):
+            config['tailnet'].pop(field, None)
     files = {'configuration.json': json.dumps({'format': 'fennec-profile', 'version': 1,
              'configuration': config}, ensure_ascii=False).encode()}
     require(len(files['configuration.json']) <= 4 * 1024 * 1024, 'Конфигурация слишком большая')
@@ -45,6 +50,11 @@ def unpack(encoded, revision):
         require(len(data) <= MAX_ARCHIVE, 'Профиль слишком большой')
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             members = archive.infolist()
+            # Check every member before opening any decoder, including the configuration.
+            require(all(v.compress_type in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED)
+                        and not v.flag_bits & ~0x080e
+                        and (v.compress_type == zipfile.ZIP_DEFLATED or not v.flag_bits & 0x0006)
+                        for v in members), 'Неподдерживаемый формат профиля')
             names = [v.filename for v in members]
             require(len(members) <= 1025 and len(set(names)) == len(names)
                     and sum(v.file_size for v in members) <= MAX_CONTENT, 'Некорректный размер профиля')
@@ -59,9 +69,12 @@ def unpack(encoded, revision):
             require(isinstance(value, dict) and set(value) == {'format', 'version', 'configuration'}
                     and value['format'] == 'fennec-profile' and type(value['version']) is int and value['version'] == 1,
                     'Неподдерживаемый формат профиля')
-            config = normalize(value['configuration'])
+            raw = value['configuration']
+            if isinstance(raw, dict) and isinstance(raw.get('tailnet'), dict):
+                raw['tailnet'] = dict(raw['tailnet'], authKey='', stateId=secrets.token_hex(8), resolved=[])
+            config = normalize(raw)
             config['revision'] = revision
-            for node in config['nodes']: node['resolved'] = []
+            for node in config['nodes'] + ([config['remoteAccess']] if 'remoteAccess' in config else []): node['resolved'] = []
             wanted = references(config)
             require(set(names) == {'configuration.json'} | {'assets/' + v + '.srs' for v in wanted}, 'Профиль содержит посторонние файлы')
             blobs = {}
@@ -79,4 +92,4 @@ def unpack(encoded, revision):
 
 def summary(config, blobs, digest):
     return {'digest': digest, 'servers': len(config['nodes']), 'groups': len(config['groups']),
-            'snapshots': len(blobs), 'bypass': config.get('bypass', False), 'killSwitch': any(g.get('killSwitch', False) for g in config['groups'] + [config['fallback']])}
+            'snapshots': len(blobs), 'bypass': config.get('bypass', False), 'remoteAccess': 'remoteAccess' in config, 'tailnet': 'tailnet' in config, 'killSwitch': any(g.get('killSwitch', False) for g in config['groups'] + [config['fallback']])}

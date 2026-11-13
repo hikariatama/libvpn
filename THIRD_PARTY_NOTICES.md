@@ -36,6 +36,14 @@ contains CPython's license. Only the interpreter and standard library needed by
 the helper are shipped; pip, headers, tkinter and user packages are omitted.
 The root helper receives the same runtime and notices during explicit installation.
 
+## Rule data
+
+libvpn bundles no routing data. Rule sets a user adds, including those from
+[SagerNet/sing-geoip](https://github.com/SagerNet/sing-geoip) and
+[SagerNet/sing-geosite](https://github.com/SagerNet/sing-geosite), are downloaded on
+request and remain under the terms of their sources. An exported profile contains
+copies of them.
+
 ## Build-only packaging tools
 
 The DMG build uses [dmgbuild 1.6.7](https://github.com/dmgbuild/dmgbuild),

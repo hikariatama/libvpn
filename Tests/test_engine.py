@@ -13,6 +13,56 @@ import engine
 
 
 class EngineTests(unittest.TestCase):
+    def test_pf_write_failures_never_truncate_previous_guard(self):
+        from unittest.mock import Mock
+        for failure in ('fsync', 'validate', 'replace'):
+            with tempfile.TemporaryDirectory() as folder:
+                path = pathlib.Path(folder) / 'guard.pf';path.write_bytes(b'old guard')
+                validate = Mock(side_effect=RuntimeError('invalid') if failure == 'validate' else None)
+                target = 'fsync' if failure == 'fsync' else 'replace'
+                context = patch.object(engine.os, target, side_effect=OSError('synthetic interruption')) if failure != 'validate' else __import__('contextlib').nullcontext()
+                with context, self.assertRaises((OSError, RuntimeError)):
+                    engine.atomic_file(path, b'new guard', validate=validate)
+                self.assertEqual(path.read_bytes(), b'old guard')
+                self.assertEqual(list(path.parent.iterdir()), [path])
+
+    def test_pf_file_is_private_validated_and_durable_before_replacement(self):
+        import os
+        with tempfile.TemporaryDirectory() as folder:
+            path = pathlib.Path(folder) / 'guard.pf';path.write_bytes(b'old guard')
+            def validate(staged):
+                self.assertEqual(path.read_bytes(), b'old guard')
+                self.assertEqual(staged.read_bytes(), b'new guard')
+                self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
+            with patch.object(engine.os, 'fsync', wraps=os.fsync) as sync:
+                engine.atomic_file(path, b'new guard', validate=validate)
+            self.assertEqual(sync.call_count, 2)
+            self.assertEqual(path.read_bytes(), b'new guard')
+
+    def test_startup_and_child_loss_flush_states_using_the_journal_guard(self):
+        from unittest.mock import Mock
+        from configuration import normalize
+        with tempfile.TemporaryDirectory() as folder:
+            base = pathlib.Path(folder)
+            current = normalize(config())
+            protection = copy.deepcopy(current);protection['groups'][0]['killSwitch'] = True
+            (base / 'transaction.json').write_text(json.dumps({'old': current, 'guard': protection}))
+            token = base / 'token';token.write_text('synthetic')
+            stopping = Mock();stopping.wait.return_value = False
+            child = Mock();child.poll.return_value = 1
+            with patch.object(engine, 'BASE', base), patch.object(engine, 'TOKEN', token), \
+                 patch.object(engine, 'RUNTIME', base / 'runtime.json'), patch.object(engine.os, 'geteuid', return_value=0), \
+                 patch.object(engine.signal, 'signal'), patch.object(engine.threading, 'Event', return_value=stopping), \
+                 patch.object(engine, 'load_configuration', return_value=current), patch.object(engine, 'apply_kill_switch') as guard, \
+                 patch.object(engine, 'build_runtime', return_value={}), patch.object(engine, 'publish'), \
+                 patch.object(engine, 'interfaces', return_value=set()), patch.object(engine.subprocess, 'Popen', return_value=child), \
+                 patch.object(engine, 'run', return_value=SimpleNamespace(returncode=0)):
+                engine.serve()
+            self.assertEqual(guard.call_count, 2)
+            for call in guard.call_args_list:
+                self.assertEqual(call.args[0], protection)
+                self.assertTrue(call.kwargs['flush'])
+
     def test_chains_use_ordered_detours(self):
         value = config(); value['nodes'].append(node('next', '198.51.100.2'))
         value['groups'][0]['nodes'].append('next')
@@ -99,7 +149,7 @@ class EngineTests(unittest.TestCase):
             result = subprocess.run([str(binary), 'rule-set', 'compile', '-o', str(compiled), str(source)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             digest = hashlib.sha256(compiled.read_bytes()).hexdigest(); compiled.rename(folder / (digest + '.srs'))
-            value = config(); value['groups'][0].update(snapshots=[digest], enabled=False, killSwitch=True)
+            value = config(); value['groups'][0].update(ruleSets=[{'kind': 'custom', 'name': 'Mixed', 'digest': digest}], enabled=False, killSwitch=True)
             path = folder / 'runtime.json'; path.write_text(json.dumps(engine.build_runtime(value, folder)))
             result = subprocess.run([str(binary), 'check', '-c', str(path)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

@@ -6,7 +6,7 @@ extension Center {
  func exportProfile() {
   guard !preview,busy == nil,!needsUpdate else { return }
   let warning=NSAlert();warning.messageText=L("Экспортировать настройки?")
-  warning.informativeText=L("Файл содержит ключи доступа к серверам (UUID и TLS pins). Он не зашифрован. Храните его в защищённом месте и не публикуйте.")
+  warning.informativeText=L("Файл содержит ключи доступа к серверам (UUID, TLS pins, ключи WireGuard). Он не зашифрован. Храните его в защищённом месте и не публикуйте.")
   warning.addButton(withTitle:L("Выбрать файл…"));warning.addButton(withTitle:L("Отменить"))
   guard warning.runModal() == .alertFirstButtonReturn else { return }
   let panel=NSSavePanel();panel.nameFieldStringValue="libvpn.libvpn"
@@ -25,15 +25,19 @@ extension Center {
   let panel=NSOpenPanel();panel.allowedContentTypes=[UTType(filenameExtension:"libvpn") ?? .data,UTType(filenameExtension:"fennec") ?? .data]
   panel.canChooseDirectories=false;panel.allowsMultipleSelection=false
   guard panel.runModal() == .OK,let url=panel.url else { return }
-  let data:Data
-  do { data=try ProfileFile.read(url) }
-  catch { self.error=L("Не удалось прочитать профиль. Максимальный размер — 32 МБ.");return }
-  let encoded=data.base64EncodedString(),revision=configuration.revision
+  let revision=configuration.revision
   busy="preview-profile";error=nil
-  bridgeRequest(["action":"preview-profile","revision":revision,"archive":encoded]) { reply in
-   self.busy=nil
-   if reply.ok,let summary=reply.profile { self.profileImport=ProfileImport(archive:encoded,revision:revision,preview:summary) }
-   else { self.error=reply.error ?? L("Не удалось открыть профиль") }
+  DispatchQueue.global(qos:.userInitiated).async {
+   do {
+    let encoded=try ProfileFile.read(url).base64EncodedString()
+    bridgeRequest(["action":"preview-profile","revision":revision,"archive":encoded]) { reply in
+     self.busy=nil
+     if reply.ok,let summary=reply.profile { self.profileImport=ProfileImport(archive:encoded,revision:revision,preview:summary) }
+     else { self.error=reply.error ?? L("Не удалось открыть профиль") }
+    }
+   } catch {
+    DispatchQueue.main.async { self.busy=nil;self.error=L("Не удалось прочитать профиль. Максимальный размер — 32 МБ.") }
+   }
   }
  }
  func applyProfile() {

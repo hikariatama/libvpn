@@ -8,78 +8,33 @@ struct EditorActionStyle:ViewModifier {
    else { content.buttonStyle(.bordered) }
  }
 }
-struct EditorFooter:View {
+struct EditorPane<Content:View>:View {
  let saving:Bool
+ let changed:Bool
  let error:String?
  let cancel:()->Void
  let save:()->Void
- var body:some View {
-  VStack(alignment:.leading,spacing:10) {
-   if let error { Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true).textSelection(.enabled) }
-   HStack(spacing:8) {
-    Spacer()
-    Button(L("Отменить"),action:cancel).keyboardShortcut(.cancelAction).modifier(EditorActionStyle())
-    Button(action:save) {
-     HStack(spacing:6) {
-      if saving { ProgressView().controlSize(.mini) }
-      Text(L("Сохранить"))
-     }
-    }.keyboardShortcut(.defaultAction).modifier(EditorActionStyle(prominent:true))
-   }.disabled(saving)
-  }
- }
-}
-struct EditorSheet<Content:View>:View {
- let title:String
- let saving:Bool
- let error:String?
- let cancel:()->Void
- let save:()->Void
+ let delete:(()->Void)?
+ let deleteTitle:String
  @ViewBuilder var content:Content
  var body:some View {
   VStack(spacing:0) {
-   Text(title).font(.headline).frame(maxWidth:.infinity).padding(.top,20).padding(.bottom,4)
-   content.frame(maxWidth:.infinity,maxHeight:.infinity).disabled(saving)
+   content.frame(minWidth:0,maxWidth:.infinity,maxHeight:.infinity).disabled(saving)
    Divider()
-   EditorFooter(saving:saving,error:error,cancel:cancel,save:save).padding(16)
-  }.background(Color(nsColor:.windowBackgroundColor))
- }
-}
-struct EditorForm<Content:View>:View {
- @ViewBuilder var content:Content
- var body:some View {
-  ScrollView {
-   VStack(alignment:.leading,spacing:14) { content }.textFieldStyle(.roundedBorder)
-    .font(.system(size:13)).controlSize(.small)
-    .padding(.horizontal,24).padding(.vertical,14)
-  }
- }
-}
-enum PreferenceFieldMetrics {
- static let labelWidth:CGFloat=100
- static let inset:CGFloat=112
-}
-struct PreferenceField<Content:View>:View {
- let title:String
- @ViewBuilder var content:Content
- var body:some View {
-  HStack(alignment:.firstTextBaseline,spacing:12) {
-   Text(title).frame(width:PreferenceFieldMetrics.labelWidth,alignment:.trailing)
-   content.frame(maxWidth:.infinity,alignment:.leading)
-  }
- }
-}
-struct PreferenceSection<Content:View>:View {
- var title:String?
- var alignedToFields=true
- @ViewBuilder var content:Content
- var body:some View {
-  VStack(alignment:.leading,spacing:9) {
-   if let title {
-    Text(title).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
-     .padding(.leading,alignedToFields ? PreferenceFieldMetrics.inset:0)
-   }
-   content
+   VStack(alignment:.leading,spacing:8) {
+    if let error { Text(error).font(.callout).foregroundStyle(.red).fixedSize(horizontal:false,vertical:true).textSelection(.enabled) }
+    HStack(spacing:8) {
+     if let delete { Button(deleteTitle,role:.destructive,action:delete).modifier(EditorActionStyle()) }
+     Spacer()
+     Button(L("Отменить"),action:cancel).keyboardShortcut(.cancelAction).modifier(EditorActionStyle()).disabled(!changed)
+     Button(action:save) {
+      HStack(spacing:6) {
+       if saving { ProgressView().controlSize(.mini) }
+       Text(L("Сохранить"))
+      }
+     }.keyboardShortcut(.defaultAction).modifier(EditorActionStyle(prominent:true)).disabled(!changed)
+    }.disabled(saving)
+   }.padding(12)
   }
  }
 }
@@ -98,6 +53,98 @@ struct CountryPicker:View {
    if !selection.isEmpty && !Self.codes.contains(selection) { Text(selection).tag(selection) }
    ForEach(Self.codes,id:\.self) { code in Text(label(code)).tag(code) }
   }.accessibilityLabel(L("Страна"))
+ }
+}
+struct RuleSetSection:View {
+ @ObservedObject var model:Center
+ @Binding var ruleSets:[RuleSet]
+ @Binding var error:String?
+ let expand:(RuleSetContents)->Void
+ @State private var source="geosite"
+ @State private var category=""
+ @State private var country=""
+ @State private var url=""
+ @State private var working:String?
+ var canAdd:Bool {
+  switch source { case "geoip":return !country.isEmpty;case "url":return !url.isEmpty;case "file":return true;default:return !category.trimmingCharacters(in:.whitespaces).isEmpty }
+ }
+ func add(_ request:[String:Any],clear:@escaping()->Void) {
+  working="add";error=nil
+  model.prepareRuleSet(request) { reply in
+   working=nil
+   guard reply.ok,let item=reply.ruleSet else { error=reply.error ?? L("Не удалось добавить набор правил");return }
+   if !ruleSets.contains(where:{$0.digest==item.digest}) { ruleSets.append(item) }
+   clear()
+  }
+ }
+ func chooseFile() {
+  let panel=NSOpenPanel();panel.allowedContentTypes=[UTType(filenameExtension:"srs") ?? .data,.json]
+  panel.canChooseDirectories=false;panel.allowsMultipleSelection=false
+  guard panel.runModal() == .OK,let url=panel.url else { return }
+  guard let data=try? ProfileFile.read(url) else { error=L("Не удалось прочитать файл. Максимальный размер — 32 МБ.");return }
+  add(["kind":"custom","name":url.deletingPathExtension().lastPathComponent,"data":data.base64EncodedString()]) {}
+ }
+ func submit() {
+  switch source {
+  case "file": chooseFile()
+  case "url":
+   let name=URL(string:url)?.deletingPathExtension().lastPathComponent ?? ""
+   add(["kind":"custom","name":name.isEmpty || name=="/" ? url:name,"url":url]) { url="" }
+  case "geoip": add(["kind":"geoip","name":country.lowercased()]) { country="" }
+  default: add(["kind":"geosite","name":category.trimmingCharacters(in:.whitespaces).lowercased()]) { category="" }
+  }
+ }
+ func listConditions(_ item:RuleSet) {
+  working=item.digest;error=nil
+  model.inspectRuleSet(item.digest) { reply in
+   working=nil
+   guard reply.ok,let contents=reply.contents else { error=reply.error ?? L("Не удалось прочитать набор правил");return }
+   expand(contents);ruleSets.removeAll{$0.digest==item.digest}
+  }
+ }
+ func name(_ item:RuleSet)->Binding<String> {
+  Binding(get:{item.name},set:{ value in if let index=ruleSets.firstIndex(where:{$0.digest==item.digest}) { ruleSets[index].name=value } })
+ }
+ var body:some View {
+  VStack(alignment:.leading,spacing:8) {
+   HStack(spacing:8) {
+    Picker(L("Источник набора правил"),selection:$source) {
+     Text("Geosite").tag("geosite");Text("GeoIP").tag("geoip");Text(L("Ссылка")).tag("url");Text(L("Файл")).tag("file")
+    }.labelsHidden().fixedSize().accessibilityLabel(L("Источник набора правил"))
+    if source=="geosite" {
+     TextField(L("Категория"),text:$category,prompt:Text("category-example")).labelsHidden().accessibilityLabel(L("Категория"))
+      .help(L("Название категории из SagerNet/sing-geosite."))
+    } else if source=="geoip" {
+     CountryPicker(selection:$country).labelsHidden().help(L("Диапазоны адресов страны из SagerNet/sing-geoip."))
+    } else if source=="url" {
+     TextField(L("Ссылка"),text:$url,prompt:Text("https://…")).labelsHidden().accessibilityLabel(L("Ссылка"))
+      .help(L("Файл .srs или исходник .json для sing-box."))
+    } else { Spacer(minLength:0) }
+    Button(action:submit) {
+     HStack(spacing:6) {
+      if working=="add" { ProgressView().controlSize(.mini) }
+      Text(source=="file" ? L("Выбрать файл…"):L("Добавить"))
+     }
+    }.fixedSize().disabled(!canAdd || working != nil).accessibilityLabel(L("Добавить набор правил"))
+     .help(source=="file" ? L("Файл .srs или исходник .json для sing-box."):L("Добавить набор правил"))
+   }
+   ForEach(ruleSets) { item in
+    HStack(spacing:8) {
+     Text(item.kindTitle).foregroundStyle(.secondary).lineLimit(1).frame(width:52,alignment:.leading)
+      .help(item.updatable ? L("Новая версия скачивается через меню «Обновить наборы правил»."):L("Локальная копия. Сама не обновляется."))
+     if item.kind=="custom" { TextField(L("Название набора правил"),text:name(item)).labelsHidden().accessibilityLabel(L("Название набора правил")) }
+     else { Text(item.name).lineLimit(1).help(item.name).frame(maxWidth:.infinity,alignment:.leading) }
+     if item.kind=="custom" {
+      Button { listConditions(item) } label:{
+       if working==item.digest { ProgressView().controlSize(.mini) } else { Image(systemName:"list.bullet") }
+      }.buttonStyle(.borderless).disabled(working != nil)
+       .help(L("Заменить набор обычными условиями этого маршрута")).accessibilityLabel(L("Заменить набор обычными условиями этого маршрута"))
+     }
+     Button { ruleSets.removeAll{$0.digest==item.digest} } label:{Image(systemName:"minus.circle")}
+      .buttonStyle(.borderless).disabled(working != nil).help(L("Удалить набор правил")).accessibilityLabel(L("Удалить набор правил"))
+    }
+   }
+  }
  }
 }
 struct ChainDropDelegate:DropDelegate {

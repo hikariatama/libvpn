@@ -39,9 +39,9 @@ jobs:
             "$RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check -
           tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
       - name: Scan complete Git history
-        run: '"$RUNNER_TEMP/gitleaks" git . --redact --no-banner --log-opts="--all"'
-      - name: Test draft release lifecycle
-        run: python3 -m unittest discover -s scripts -p 'test_publish_draft.py'
+        run: python3 scripts/check-secrets.py all --gitleaks "$RUNNER_TEMP/gitleaks"
+      - name: Test secret detection and draft release lifecycle
+        run: GITLEAKS_BINARY="$RUNNER_TEMP/gitleaks" python3 -m unittest discover -s scripts -p 'test_*.py'
 
   check:
     name: Checks
@@ -115,29 +115,8 @@ jobs:
       - name: Test before building
         run: ./test.sh
 
-      - name: Prepare release signing key
-        if: github.event_name != 'pull_request'
-        env:
-          RELEASE_KEY: ${{ secrets.FENNEC_UPDATE_PRIVATE_KEY }}
-        run: |
-          python3 - <<'PYKEY'
-          import base64, os, pathlib
-          value = os.environ.get('RELEASE_KEY', '')
-          if value:
-              path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'fennec-release.key'
-              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-              with os.fdopen(fd, 'wb') as output:
-                  output.write(base64.b64decode(value, validate=True))
-              with open(os.environ['GITHUB_ENV'], 'a') as output:
-                  output.write('FENNEC_SIGNING_KEY_FILE=' + str(path) + '\n')
-          PYKEY
-
-      - name: Build app, ZIP and styled DMG
-        run: ./build.sh
-
-      - name: Remove temporary signing key
-        if: always()
-        run: rm -f "$RUNNER_TEMP/fennec-release.key"
+      - name: Build unsigned app, ZIP and styled DMG
+        run: ./build.sh --unsigned
 
       - name: Test with the pinned runtime
         run: ./test.sh
@@ -183,30 +162,3 @@ jobs:
               for item in data['files']:
                   summary.write('| ' + item['name'] + ' | `' + item['sha256'] + '` |\n')
           PY
-
-  release:
-    name: Draft release
-    needs: [build]
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: write
-      actions: read
-    concurrency:
-      group: draft-release
-      cancel-in-progress: false
-    steps:
-      - name: Check out sources
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          persist-credentials: false
-      - name: Download verified distributions
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Replace version draft and its assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/publish-draft.py artifacts

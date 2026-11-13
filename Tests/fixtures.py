@@ -14,7 +14,7 @@ def node(identifier='sample', address='192.0.2.1'):
 
 def group(identifier='custom'):
     return {'id': identifier, 'title': 'Custom', 'flag': '', 'enabled': True, 'nodes': ['sample'],
-            'domains': ['example.invalid'], 'suffixes': [], 'cidrs': [], 'snapshots': []}
+            'domains': ['example.invalid'], 'suffixes': [], 'cidrs': [], 'ruleSets': []}
 
 
 def config():

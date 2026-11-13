@@ -16,6 +16,18 @@ Never include real credentials, server endpoints, VLESS links, profiles or full
 production diagnostics. Test configuration changes through observable outcomes,
 transaction failures and forbidden side effects rather than source-string checks.
 Live installation, updates, PF and VPN testing needs a prepared, explicitly authorized Mac.
+
+Before committing, install Gitleaks 8.30.1 (`brew install gitleaks` on macOS), then
+enable this repository's hook with `git config --local core.hooksPath .githooks`.
+Run `python3 scripts/check-secrets.py` to scan all Git refs, the working sources,
+and the staged diff. The working-tree scan copies only tracked and non-ignored
+source files into a temporary directory; it never walks ignored build output,
+local profiles or runtime state. All findings are fully redacted. The hook scans
+the staged diff, and CI uses the same pinned version and project configuration.
+Default detectors remain enabled; the VLESS detector additionally checks credential
+URIs. Allow only specific synthetic identities in test paths, never entire test
+directories, source trees or commits. Do not add real-secret baselines or inline
+suppression comments to make a scan pass.
 Private-runtime changes must preserve isolated `-I -S -B` launches, relocatability,
 OS CA verification, dependency notices and validation before service replacement.
 

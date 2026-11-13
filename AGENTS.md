@@ -3,8 +3,8 @@
 ## Build and check
 
 - Native SwiftUI/AppKit sources are in `Source/`; `Resources/` owns the helper and runtime; `Tools/` owns build/packaging tools; `Tests/` uses synthetic data.
-- Use the macOS 26 SDK and Python 3.10+ for full packaging. Run `./test.sh`, build with `env -u FENNEC_SIGNING_KEY_FILE CI=1 GITHUB_REF=refs/heads/main ./build.sh`, then run tests again against the bundled runtime.
-- The CI build above must not read release signing keys. Signed packaging is a separate release operation; never generate or rotate keys implicitly.
+- Use the macOS 26 SDK and Python 3.10+ for full packaging. Run `./test.sh`, build with `./build.sh --unsigned`, then run tests again against the bundled runtime.
+- `--unsigned` must not read release signing keys. Signed packaging is a separate release operation; never generate or rotate keys implicitly.
 - Keep pinned runtime hashes, isolated CPython (`-I -S -B`), relocatability and all third-party notices. End users need no developer tools or system Python.
 - Verify deep/strict code signatures and the canonical ZIP/DMG with `Tools/distribution.py`. Packaging may mount only its own temporary images and must not install applications or helpers.
 - Keep generated files in ignored `work/` and `outputs/`. Builds/tests must not request administrator access, change launchd/PF/routes, connect a VPN or use installed runtime state.

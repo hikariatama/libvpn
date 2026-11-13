@@ -6,11 +6,18 @@ import re
 import urllib.parse
 import uuid
 
-VERSION = 9
+VERSION = 10
 MAX_NODES = 256
 MAX_GROUPS = 256
+MAX_RULE_SETS = 256
+MATCHERS = ('domains', 'suffixes', 'keywords', 'regexes', 'cidrs', 'ruleSets')
 ID = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}')
 DIGEST = re.compile(r'[a-f0-9]{64}')
+TAILNET_FIELDS = {'enabled', 'controlURL', 'hostname', 'authKey', 'ephemeral', 'acceptRoutes', 'route', 'listenPort', 'services', 'stateId'}
+TAILNET_PORT = 41641
+MAX_TAILNET_SERVICES = 64
+STATE_ID = re.compile(r'[0-9a-f]{16}')
+GEO_NAMES = {'geoip': re.compile(r'[a-z0-9][a-z0-9-]{0,31}'), 'geosite': re.compile(r'[a-z0-9][a-z0-9@!._-]{0,127}')}
 
 
 class ConfigurationError(ValueError):
@@ -108,9 +115,139 @@ def node(raw):
     return result
 
 
+def wireguard_key(value):
+    try:
+        valid = isinstance(value, str) and len(base64.b64decode(value, validate=True)) == 32
+    except (ValueError, TypeError):
+        valid = False
+    require(valid, 'Некорректный ключ WireGuard')
+    return value
+
+
+def tunnel_ip(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        raise ConfigurationError('Некорректный адрес в туннеле') from None
+    require(address.is_private and not address.is_loopback and not address.is_link_local and not address.is_multicast,
+            'Адрес в туннеле должен быть частным')
+    return str(address)
+
+
+def remote_access(raw, groups):
+    require(isinstance(raw, dict), 'Некорректные настройки удалённого доступа')
+    fields = {'enabled', 'address', 'port', 'serverPublicKey', 'tunnelAddress', 'peerAddress', 'localPort', 'route', 'privateKey', 'publicKey'}
+    require(not set(raw) - (fields | {'resolved'}) and not fields - set(raw), 'Некорректные настройки удалённого доступа')
+    require(type(raw['enabled']) is bool, 'Некорректные настройки удалённого доступа')
+    for field in ('port', 'localPort'):
+        require(type(raw[field]) is int and 1 <= raw[field] <= 65535, 'Некорректный порт')
+    tunnel, peer = tunnel_ip(raw['tunnelAddress']), tunnel_ip(raw['peerAddress'])
+    require(tunnel != peer and ipaddress.ip_address(tunnel).version == ipaddress.ip_address(peer).version,
+            'Адреса Mac и сервера в туннеле должны различаться и быть одного типа')
+    require(isinstance(raw['route'], str), 'Некорректные настройки удалённого доступа')
+    if raw['route']:
+        chain = next((g for g in groups if g['id'] == raw['route']), None)
+        require(chain is not None and bool(chain['nodes']), 'Маршрут для удалённого доступа должен существовать и иметь цепочку')
+    resolved = raw.get('resolved', [])
+    require(isinstance(resolved, list) and len(resolved) <= 32, 'Некорректные адреса сервера')
+    try:
+        resolved = sorted({str(ipaddress.ip_address(v)) for v in resolved})
+    except ValueError:
+        raise ConfigurationError('Некорректный IP сервера') from None
+    return {'enabled': raw['enabled'], 'address': hostname(raw['address']), 'port': raw['port'],
+            'serverPublicKey': wireguard_key(raw['serverPublicKey']),
+            'tunnelAddress': tunnel, 'peerAddress': peer, 'localPort': raw['localPort'], 'route': raw['route'],
+            'privateKey': wireguard_key(raw['privateKey']), 'publicKey': wireguard_key(raw['publicKey']),
+            'resolved': resolved}
+
+
+def control_url(value):
+    message = 'Укажите HTTPS-адрес сервера управления без логина, пароля и параметров'
+    require(isinstance(value, str) and len(value) <= 2048 and not any(ord(c) <= 32 for c in value), message)
+    if not value:
+        return value
+    try:
+        parts = urllib.parse.urlsplit(value)
+        host = parts.hostname
+        parts.port
+    except ValueError:
+        raise ConfigurationError(message) from None
+    require(parts.scheme == 'https' and bool(host) and parts.username is None and parts.password is None
+            and not parts.query and not parts.fragment, message)
+    return value.rstrip('/')
+
+
+def tailnet_service(raw):
+    require(isinstance(raw, dict) and set(raw) == {'protocol', 'port', 'localPort'}, 'Некорректный открытый порт')
+    require(raw['protocol'] in ('tcp', 'udp'), 'Некорректный протокол открытого порта')
+    for field in ('port', 'localPort'):
+        require(type(raw[field]) is int and 1 <= raw[field] <= 65535, 'Некорректный порт')
+    return {'protocol': raw['protocol'], 'port': raw['port'], 'localPort': raw['localPort']}
+
+
+def tailnet(raw, groups):
+    message = 'Некорректные настройки tailnet'
+    require(isinstance(raw, dict) and not set(raw) - (TAILNET_FIELDS | {'resolved'}) and not TAILNET_FIELDS - set(raw), message)
+    for field in ('enabled', 'ephemeral', 'acceptRoutes'):
+        require(type(raw[field]) is bool, message)
+    name = raw['hostname']
+    require(isinstance(name, str) and (not name or re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', name)),
+            'Имя устройства: строчные латинские буквы, цифры и дефис, до 63 символов')
+    key = raw['authKey']
+    require(isinstance(key, str) and len(key) <= 512 and not any(ord(c) <= 32 or ord(c) > 126 for c in key), 'Некорректный ключ авторизации')
+    require(type(raw['listenPort']) is int and 1024 <= raw['listenPort'] <= 65535, 'Порт tailnet должен быть от 1024 до 65535')
+    require(isinstance(raw['stateId'], str) and STATE_ID.fullmatch(raw['stateId']), message)
+    require(isinstance(raw['route'], str), message)
+    if raw['route']:
+        chain = next((g for g in groups if g['id'] == raw['route']), None)
+        require(chain is not None and bool(chain['nodes']), 'Маршрут для подключения к tailnet должен существовать и иметь цепочку')
+    services = raw['services']
+    require(isinstance(services, list) and len(services) <= MAX_TAILNET_SERVICES, 'Слишком много открытых портов')
+    services = [tailnet_service(v) for v in services]
+    require(len({(v['protocol'], v['port']) for v in services}) == len(services), 'Открытый порт повторяется')
+    resolved = raw.get('resolved', [])
+    require(isinstance(resolved, list) and len(resolved) <= 32, message)
+    try:
+        resolved = sorted({str(ipaddress.ip_address(v)) for v in resolved})
+    except ValueError:
+        raise ConfigurationError(message) from None
+    return {'enabled': raw['enabled'], 'controlURL': control_url(raw['controlURL']), 'hostname': name, 'authKey': key,
+            'ephemeral': raw['ephemeral'], 'acceptRoutes': raw['acceptRoutes'], 'route': raw['route'],
+            'listenPort': raw['listenPort'], 'services': services, 'stateId': raw['stateId'], 'resolved': resolved}
+
+
+def rule_set_url(value):
+    message = 'Укажите HTTPS-адрес набора правил без логина и пароля'
+    require(isinstance(value, str) and len(value) <= 2048 and not any(ord(c) <= 32 for c in value), message)
+    try:
+        parts = urllib.parse.urlsplit(value)
+        host = parts.hostname
+        parts.port
+    except ValueError:
+        raise ConfigurationError(message) from None
+    require(parts.scheme == 'https' and bool(host) and parts.username is None and parts.password is None, message)
+    return value
+
+
+def rule_set(raw):
+    require(isinstance(raw, dict) and not set(raw) - {'kind', 'name', 'digest', 'url'}, 'Некорректный набор правил')
+    kind, digest = raw.get('kind'), raw.get('digest')
+    require((kind == 'custom' or kind in GEO_NAMES) and isinstance(digest, str) and DIGEST.fullmatch(digest), 'Некорректный набор правил')
+    result = {'kind': kind, 'digest': digest}
+    if kind == 'custom':
+        result['name'] = text(raw.get('name'), 'название набора правил', 128)
+        if raw.get('url'):
+            result['url'] = rule_set_url(raw['url'])
+    else:
+        name = raw.get('name')
+        require(isinstance(name, str) and GEO_NAMES[kind].fullmatch(name.strip().lower()) and not raw.get('url'), 'Некорректный набор правил')
+        result['name'] = name.strip().lower()
+    return result
+
+
 def route(raw, registry, fallback=False):
     require(isinstance(raw, dict), 'Некорректная группа')
-    allowed = {'id', 'title', 'flag', 'enabled', 'nodes', 'killSwitch'} | (set() if fallback else {'domains', 'suffixes', 'cidrs', 'snapshots'})
+    allowed = {'id', 'title', 'flag', 'enabled', 'nodes', 'killSwitch'} | (set() if fallback else set(MATCHERS) | {'exit', 'overrideAddress'})
     require(not set(raw) - allowed, 'Неподдерживаемое поле группы')
     result = {k: raw.get(k) for k in ('id', 'title', 'flag', 'enabled', 'nodes')}
     require(type(raw.get('killSwitch', False)) is bool, 'Некорректный kill switch маршрута')
@@ -123,14 +260,35 @@ def route(raw, registry, fallback=False):
     ids = result['nodes']
     require(isinstance(ids, list) and len(ids) <= MAX_NODES and all(isinstance(i, str) and i in registry for i in ids), 'Неизвестный сервер цепочки')
     require(len(set(ids)) == len(ids), 'Сервер повторяется в цепочке')
-    require(not result['enabled'] or bool(ids), 'Для включения нужна цепочка серверов')
+    exit_type = raw.get('exit', 'chain')
+    require(exit_type in ('chain', 'tailnet'), 'Некорректный выход маршрута')
+    if exit_type == 'tailnet':
+        require(not ids, 'Маршрут через tailnet не использует цепочку серверов')
+        result['exit'] = 'tailnet'
+    else:
+        require(not result['enabled'] or bool(ids), 'Для включения нужна цепочка серверов')
+    override = raw.get('overrideAddress', '')
+    if override:
+        try:
+            address = ipaddress.ip_address(override if isinstance(override, str) else '')
+        except ValueError:
+            raise ConfigurationError('Некорректный адрес назначения') from None
+        require(not address.is_unspecified and not address.is_multicast, 'Некорректный адрес назначения')
+        result['overrideAddress'] = str(address)
     if not fallback:
-        for field in ('domains', 'suffixes', 'cidrs', 'snapshots'):
+        for field in MATCHERS:
             values = raw.get(field, [])
             require(isinstance(values, list) and len(values) <= 100000, 'Слишком большой список правил')
-            if field == 'snapshots':
-                require(all(isinstance(v, str) and DIGEST.fullmatch(v) for v in values), 'Некорректный снимок правил')
-                result[field] = list(dict.fromkeys(values))
+            if field == 'ruleSets':
+                require(len(values) <= MAX_RULE_SETS, 'Слишком много наборов правил')
+                unique = {}
+                for item in map(rule_set, values):
+                    unique.setdefault(item['digest'], item)
+                result[field] = list(unique.values())
+            elif field == 'keywords':
+                result[field] = list(dict.fromkeys(text(v, 'ключевое слово', 253) for v in values))
+            elif field == 'regexes':
+                result[field] = list(dict.fromkeys(text(v, 'регулярное выражение', 1024) for v in values))
             elif field == 'cidrs':
                 require(all(isinstance(v, str) for v in values), 'Ожидается текстовый IP/CIDR')
                 try:
@@ -139,13 +297,35 @@ def route(raw, registry, fallback=False):
                     raise ConfigurationError('Некорректный IP/CIDR') from None
             else:
                 result[field] = list(dict.fromkeys(hostname(v) for v in values))
-        require(any(result[f] for f in ('domains', 'suffixes', 'cidrs', 'snapshots')), 'Добавьте условие совпадения')
+        require(any(result[f] for f in MATCHERS), 'Добавьте условие совпадения')
+    return result
+
+
+def migrate_group(group):
+    # v9 referenced anonymous .srs digests. Each stays attached as a renamable custom set.
+    if not isinstance(group, dict) or 'snapshots' not in group:
+        return group
+    result = dict(group)
+    digests = result.pop('snapshots')
+    require(isinstance(digests, list) and all(isinstance(v, str) and DIGEST.fullmatch(v) for v in digests), 'Некорректный снимок правил')
+    result['ruleSets'] = [{'kind': 'custom', 'name': v[:12], 'digest': v} for v in digests]
+    return result
+
+
+def migrate(value):
+    # Read-time only: the file stays v9 until the next committed change, so a helper rollback can still read it.
+    if not isinstance(value, dict) or value.get('schemaVersion') != 9:
+        return value
+    result = dict(value, schemaVersion=VERSION)
+    if isinstance(value.get('groups'), list):
+        result['groups'] = [migrate_group(v) for v in value['groups']]
     return result
 
 
 def normalize(value):
+    value = migrate(value)
     require(isinstance(value, dict) and value.get('schemaVersion') == VERSION, 'Неподдерживаемая версия конфигурации')
-    require(not set(value) - {'schemaVersion', 'revision', 'nodes', 'groups', 'fallback', 'killSwitch', 'bypass'}, 'Неизвестное поле конфигурации')
+    require(not set(value) - {'schemaVersion', 'revision', 'nodes', 'groups', 'fallback', 'killSwitch', 'bypass', 'remoteAccess', 'tailnet'}, 'Неизвестное поле конфигурации')
     require(type(value.get('revision')) is int and value['revision'] >= 0, 'Некорректная ревизия')
     require(type(value.get('killSwitch')) is bool, 'Некорректный kill switch')
     require(type(value.get('bypass', False)) is bool, 'Некорректный bypass')
@@ -160,16 +340,23 @@ def normalize(value):
     require(isinstance(value.get('fallback'), dict), 'Некорректная группа')
     groups = [route(dict(v, killSwitch=value['killSwitch'] or v.get('killSwitch', False)), registry) for v in groups]
     require(len({v['id'] for v in groups}) == len(groups), 'Повторяющийся идентификатор группы')
-    return {'schemaVersion': VERSION, 'revision': value['revision'], 'nodes': nodes, 'groups': groups,
-            'fallback': route(dict(value.get('fallback') or {}, killSwitch=value['killSwitch'] or value['fallback'].get('killSwitch', False)), registry, True),
-            'killSwitch': False, 'bypass': value.get('bypass', False)}
+    result = {'schemaVersion': VERSION, 'revision': value['revision'], 'nodes': nodes, 'groups': groups,
+              'fallback': route(dict(value.get('fallback') or {}, killSwitch=value['killSwitch'] or value['fallback'].get('killSwitch', False)), registry, True),
+              'killSwitch': False, 'bypass': value.get('bypass', False)}
+    if 'remoteAccess' in value:
+        result['remoteAccess'] = remote_access(value['remoteAccess'], groups + [result['fallback']])
+    if 'tailnet' in value:
+        result['tailnet'] = tailnet(value['tailnet'], groups + [result['fallback']])
+    require('tailnet' in result or not any(g.get('exit') == 'tailnet' for g in groups),
+            'Маршрут через tailnet требует настроенного tailnet')
+    return result
 
 
 def public(value, editing=False):
     result = copy.deepcopy(value)
     if not editing:
         for group in result['groups']:
-            for field in ('domains', 'suffixes', 'cidrs', 'snapshots'):
+            for field in MATCHERS:
                 group.pop(field, None)
     for item in result['nodes']:
         secret = item.pop('uuid')
@@ -183,6 +370,18 @@ def public(value, editing=False):
         else:
             for key in ('address', 'port', 'tls'):
                 item.pop(key, None)
+    remote = result.get('remoteAccess')
+    if remote:
+        remote.pop('privateKey'); remote.pop('resolved', None)
+        if not editing:
+            result['remoteAccess'] = {k: remote[k] for k in ('enabled', 'route', 'localPort')}
+    network = result.get('tailnet')
+    if network:
+        key = network.pop('authKey'); network.pop('stateId'); network.pop('resolved', None)
+        if editing:
+            network['hasAuthKey'] = bool(key)
+        else:
+            result['tailnet'] = {k: network[k] for k in ('enabled', 'route', 'controlURL', 'hostname')}
     return result
 
 

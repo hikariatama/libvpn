@@ -43,7 +43,7 @@ class InstallationTests(unittest.TestCase):
             stack.enter_context(patch.object(installation, 'ensure_pf_anchor'))
             stack.enter_context(patch.object(bridge, 'start_engine'))
             stack.enter_context(patch.object(bridge, 'ready', side_effect=RuntimeError('synthetic failure') if fail else None))
-            stack.enter_context(patch.object(bridge, 'client', return_value={'ok': True, 'installed': True, 'version': 9, 'helperBuild': 'development'}))
+            stack.enter_context(patch.object(bridge, 'client', return_value={'ok': True, 'installed': True, 'version': 10, 'helperBuild': 'development'}))
             yield root, home, commands
 
     def test_replacement_is_validated_and_previous_files_are_backed_up(self):
@@ -56,13 +56,44 @@ class InstallationTests(unittest.TestCase):
             self.assertEqual(commands[0][-1], 'self-test')
             self.assertEqual(commands[1][1], 'check')
             self.assertEqual((home / 'Engine/configuration.json').stat().st_mode & 0o777, 0o600)
-            self.assertTrue(all(command[0] == '/bin/launchctl' for command in commands[2:]))
+            self.assertTrue(all(command[0] == '/bin/launchctl' or command[:2] == ['/sbin/pfctl', '-n'] for command in commands[2:]))
             self.assertEqual((home / 'Python/bin/python3').read_text(), 'synthetic private interpreter')
             for label, role in (('local.fennec.engine', 'engine'), ('local.fennec.helper', 'bridge')):
                 plist = plistlib.loads((root / 'LaunchDaemons' / (label + '.plist')).read_bytes())
                 args = plist['ProgramArguments']
                 self.assertEqual(args[:5], [str(home / 'Python/bin/python3'), '-I', '-S', '-B', str(home / 'launcher.py')])
                 self.assertEqual(args[5], role)
+
+    def test_rule_set_assets_are_carried_over_including_v9_snapshots(self):
+        import hashlib
+        data = b'SRS synthetic rule set'
+        digest = hashlib.sha256(data).hexdigest()
+        with self.environment() as (root, home, commands):
+            (engine.ASSETS).mkdir(); (engine.ASSETS / (digest + '.srs')).write_bytes(data)
+            legacy = config(); legacy['schemaVersion'] = 9
+            for group in legacy['groups']: group.pop('ruleSets'); group['snapshots'] = [digest]
+            engine.CONFIG.write_text(json.dumps(legacy))
+            self.assertTrue(installation.install(501)['ok'])
+            self.assertEqual((home / 'Engine/assets' / (digest + '.srs')).read_bytes(), data)
+
+    def test_tailnet_node_identity_is_carried_over(self):
+        from test_tailnet import configured
+        value = configured()
+        state_id = value['tailnet']['stateId']
+        with self.environment() as (root, home, commands):
+            tailnet = engine.BASE / 'tailnet'
+            with patch.object(engine, 'TAILNET_DIR', tailnet):
+                engine.CONFIG.write_text(json.dumps(value))
+                state = tailnet / state_id; (state / 'profile-data').mkdir(parents=True)
+                (state / 'tailscaled.state').write_text('synthetic node identity')
+                (state / 'outside').symlink_to(root / 'pf.conf')
+                (tailnet / ('f' * 16)).mkdir()
+                self.assertTrue(installation.install(501)['ok'])
+                kept = home / 'Engine/tailnet' / state_id
+                self.assertEqual((kept / 'tailscaled.state').read_text(), 'synthetic node identity')
+                self.assertTrue((kept / 'profile-data').is_dir())
+                self.assertFalse((kept / 'outside').exists() or (kept / 'outside').is_symlink())
+                self.assertFalse((home / 'Engine/tailnet' / ('f' * 16)).exists())
 
     def test_missing_or_broken_private_runtime_never_changes_services(self):
         with self.environment() as (root, home, commands):
