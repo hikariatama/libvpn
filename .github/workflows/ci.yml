@@ -1,0 +1,212 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  secrets:
+    name: Secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install checksum-pinned Gitleaks
+        run: |
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz"
+          printf '%s  %s\n' \
+            551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb \
+            "$RUNNER_TEMP/gitleaks.tar.gz" | sha256sum --check -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan complete Git history
+        run: '"$RUNNER_TEMP/gitleaks" git . --redact --no-banner --log-opts="--all"'
+      - name: Test draft release lifecycle
+        run: python3 -m unittest discover -s scripts -p 'test_publish_draft.py'
+
+  check:
+    name: Checks
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run tests
+        run: ./test.sh
+      - name: Check source tree
+        run: git diff --exit-code
+
+  build:
+    name: Build · macOS ${{ matrix.arch }}
+    needs: [check, secrets]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      FENNEC_BUILD_PYTHON: python3
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up packaging Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: Tools/requirements-build.txt
+
+      - name: Verify runner architecture and version
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          python3 Tools/distribution.py metadata --github-output "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          xcrun swiftc --version
+          xcrun --show-sdk-version
+
+      - name: Cache checksum-pinned runtime archives
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            work/runtime-v9/*.tar.gz
+            work/python-runtime/*.tar.gz
+            work/python-runtime/*.tar.zst
+          key: runtimes-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Resources/fetch_runtime.py', 'Tools/fetch_python.py') }}
+
+      - name: Test before building
+        run: ./test.sh
+
+      - name: Prepare release signing key
+        if: github.event_name != 'pull_request'
+        env:
+          RELEASE_KEY: ${{ secrets.FENNEC_UPDATE_PRIVATE_KEY }}
+        run: |
+          python3 - <<'PYKEY'
+          import base64, os, pathlib
+          value = os.environ.get('RELEASE_KEY', '')
+          if value:
+              path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'fennec-release.key'
+              fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+              with os.fdopen(fd, 'wb') as output:
+                  output.write(base64.b64decode(value, validate=True))
+              with open(os.environ['GITHUB_ENV'], 'a') as output:
+                  output.write('FENNEC_SIGNING_KEY_FILE=' + str(path) + '\n')
+          PYKEY
+
+      - name: Build app, ZIP and styled DMG
+        run: ./build.sh
+
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/fennec-release.key"
+
+      - name: Test with the pinned runtime
+        run: ./test.sh
+
+      - name: Verify packaged content, layout, signatures and checksums
+        env:
+          ARTIFACT_STEM: ${{ steps.metadata.outputs.stem }}
+        run: work/dmg-venv/bin/python3 Tools/distribution.py verify "outputs/$ARTIFACT_STEM.json" --require-dmg
+
+      - name: Confirm the build leaves sources unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+
+      - name: Upload verified distribution
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.metadata.outputs.stem }}
+          path: |
+            outputs/${{ steps.metadata.outputs.stem }}.dmg
+            outputs/${{ steps.metadata.outputs.stem }}.zip
+            outputs/${{ steps.metadata.outputs.stem }}.sha256
+            outputs/${{ steps.metadata.outputs.stem }}.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+
+      - name: Write build summary
+        if: success()
+        env:
+          ARTIFACT_STEM: ${{ steps.metadata.outputs.stem }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          data = json.loads(pathlib.Path('outputs', os.environ['ARTIFACT_STEM'] + '.json').read_text())
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              summary.write('### ' + data['stem'] + '\n\n')
+              summary.write('DMG and ZIP verified. Ad-hoc signed; not notarized.\n\n')
+              summary.write('| File | SHA-256 |\n| --- | --- |\n')
+              for item in data['files']:
+                  summary.write('| ' + item['name'] + ' | `' + item['sha256'] + '` |\n')
+          PY
+
+  release:
+    name: Draft release
+    needs: [build]
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    concurrency:
+      group: draft-release
+      cancel-in-progress: false
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Download verified distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Replace version draft and its assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/publish-draft.py artifacts
