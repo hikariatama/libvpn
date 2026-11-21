@@ -36,12 +36,9 @@ jobs:
           git merge-base --is-ancestor "$release_sha" origin/main
           echo "sha=$release_sha" >> "$GITHUB_OUTPUT"
 
-  sign:
+  build:
     needs: resolve
-    name: Sign ${{ needs.resolve.outputs.sha }} on ${{ matrix.runner }}
-    # This environment MUST restrict deployments to main, require owner review,
-    # and own the secret below. Repository/org signing secrets must be removed.
-    environment: release-signing
+    name: Build without keys on ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
@@ -66,33 +63,161 @@ jobs:
           set -euo pipefail
           test "$RELEASE_TAG" = "v$(cat VERSION)"
           ./test.sh
-      - name: Build signed distribution
-        env:
-          RELEASE_KEY: ${{ secrets.FENNEC_PROTECTED_UPDATE_KEY }}
+      - name: Build and test without a signing key
         run: |
           set -euo pipefail
-          key_file="$RUNNER_TEMP/fennec-release.key"
-          trap 'rm -f "$key_file"' EXIT
-          export FENNEC_SIGNING_KEY_FILE="$key_file"
-          python3 -I -S -B - <<'PY'
-          import base64, os
-          key = base64.b64decode(os.environ.pop('RELEASE_KEY'), validate=True)
-          if len(key) != 32:
-              raise SystemExit('Missing or invalid protected signing key')
-          fd = os.open(os.environ['FENNEC_SIGNING_KEY_FILE'], os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-          with os.fdopen(fd, 'wb') as output:
-              output.write(key)
-          PY
-          unset RELEASE_KEY
-          ./build.sh
+          ./build.sh --unsigned --app-only
           ./test.sh
-      - name: Verify distribution
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+          persist-credentials: false
+      - name: Prepare exact helper manifest
         id: metadata
         run: |
           set -euo pipefail
           python3 Tools/distribution.py metadata --github-output "$GITHUB_OUTPUT"
-          stem=$(python3 Tools/distribution.py metadata | python3 -c 'import json,sys; print(json.load(sys.stdin)["stem"])')
-          work/dmg-venv/bin/python3 Tools/distribution.py verify "outputs/$stem.json" --require-dmg
+          python3 release-tools/Tools/release_package.py prepare outputs/libvpn.app outputs/release-input
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-input-${{ steps.metadata.outputs.architecture }}
+          path: outputs/release-input/manifest.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: release-build-${{ steps.metadata.outputs.architecture }}
+          path: outputs/${{ steps.metadata.outputs.stem }}.zip
+          if-no-files-found: error
+          compression-level: 0
+
+  sign:
+    needs: [resolve, build]
+    name: Sign ${{ needs.resolve.outputs.sha }} with the protected key
+    runs-on: macos-15
+    # Keep the existing owner approval and main-only environment restrictions.
+    # The production secret belongs only to this environment, never repo/org scope.
+    environment: release-signing
+    timeout-minutes: 10
+    steps:
+      # Only manifest data crosses from candidate runners. No candidate checkout,
+      # executable, dependency, build hook or test ever runs on this runner.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-input-arm64
+          path: ${{ runner.temp }}/release-input/arm64
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-input-x86_64
+          path: ${{ runner.temp }}/release-input/x86_64
+      - name: Prepare independently pinned trusted signer
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          trusted=https://raw.githubusercontent.com/hikariatama/libvpn/927a9113af69516309493118180aad690768504b
+          curl --fail --silent --show-error --location "$trusted/Tools/PackageSignature.swift" -o PackageSignature.swift
+          curl --fail --silent --show-error --location "$trusted/Resources/update-public-key.txt" -o signing-public-key.txt
+          echo 'f831ca82666f0948a1982c5b29c7a159d54a30f41db1110140a69ef68819bb90  PackageSignature.swift' | shasum -a 256 -c -
+          echo 'c18cecd509aa6f071a53a36ae37cedd1a558931def64a91adcd5efb6e8d5310d  signing-public-key.txt' | shasum -a 256 -c -
+          xcrun swiftc -O -parse-as-library PackageSignature.swift -o PackageSignature
+      - name: Sign exact manifests with the existing protected key
+        env:
+          RELEASE_KEY: ${{ secrets.FENNEC_PROTECTED_UPDATE_KEY }}
+        run: |
+          set -euo pipefail
+          trap 'rm -f "$RUNNER_TEMP/fennec-release.key"' EXIT
+          /usr/bin/python3 -I -S -B - <<'PY'
+          # BEGIN TRUSTED MANIFEST SIGNING
+          import base64, json, os, pathlib, subprocess
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          encoded_key = os.environ.pop('RELEASE_KEY')
+          manifests = []
+          for architecture in ('arm64', 'x86_64'):
+              path = root / 'release-input' / architecture / 'manifest.json'
+              if path.stat().st_size >= 4096:
+                  raise ValueError('Manifest exceeds installed verifier bounds')
+              raw = path.read_bytes()
+              value = json.loads(raw)
+              if (set(value) != {'schemaVersion', 'build', 'sequence', 'architecture', 'sha256', 'size'}
+                      or type(value['schemaVersion']) is not int or value['schemaVersion'] != 1
+                      or value['architecture'] != architecture
+                      or type(value['sequence']) is not int or value['sequence'] <= 0
+                      or type(value['size']) is not int or not 0 < value['size'] <= 128 * 1024 * 1024
+                      or any(not isinstance(value[field], str) or len(value[field]) != 64
+                             or any(c not in '0123456789abcdef' for c in value[field]) for field in ('build', 'sha256'))
+                      or raw != (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()):
+                  raise ValueError('Invalid canonical helper manifest')
+              destination = root / 'signatures' / architecture
+              destination.mkdir(parents=True)
+              manifest = destination / 'manifest.json'
+              manifest.write_bytes(raw)
+              manifests.append(manifest)
+          key = base64.b64decode(encoded_key, validate=True)
+          if len(key) != 32:
+              raise ValueError('Invalid protected signing key')
+          key_file = root / 'fennec-release.key'
+          fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+          try:
+              with os.fdopen(fd, 'wb') as output:
+                  output.write(key)
+              for manifest in manifests:
+                  signature = manifest.parent / 'signature.txt'
+                  subprocess.run([str(root / 'PackageSignature'), 'sign', str(key_file), str(manifest), str(signature)], check=True)
+                  subprocess.run([str(root / 'PackageSignature'), 'verify', str(root / 'signing-public-key.txt'), str(manifest), str(signature)], check=True)
+          finally:
+              key_file.unlink()
+          # END TRUSTED MANIFEST SIGNING
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: helper-signatures
+          path: ${{ runner.temp }}/signatures
+          if-no-files-found: error
+
+  package:
+    needs: [resolve, sign]
+    name: Package without keys on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      FENNEC_BUILD_PYTHON: python3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          path: release-tools
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+      - id: metadata
+        run: python3 Tools/distribution.py metadata --github-output "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-build-${{ steps.metadata.outputs.architecture }}
+          path: work/release-unsigned
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: helper-signatures
+          path: work/release-signatures
+      - name: Attach signature and package the unchanged helper
+        run: |
+          set -euo pipefail
+          python3 release-tools/Tools/release_package.py finalize \
+            "work/release-unsigned/${{ steps.metadata.outputs.stem }}.zip" \
+            "work/release-signatures/${{ steps.metadata.outputs.architecture }}"
+          /usr/bin/ditto -x -k "outputs/${{ steps.metadata.outputs.stem }}.zip" outputs
+          ./test.sh
+          work/dmg-venv/bin/python3 Tools/distribution.py verify "outputs/${{ steps.metadata.outputs.stem }}.json" --require-dmg
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: signed-${{ steps.metadata.outputs.stem }}
@@ -105,7 +230,7 @@ jobs:
           compression-level: 0
 
   draft:
-    needs: [resolve, sign]
+    needs: [resolve, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write

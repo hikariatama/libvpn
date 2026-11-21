@@ -32,16 +32,25 @@ def pack(resources, archive):
     return hashlib.sha256(archive.read_bytes()).hexdigest()
 
 
+def manifest_for(resources, archive):
+    resources, archive = pathlib.Path(resources), pathlib.Path(archive)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    release = json.loads((resources / 'update-release.json').read_text())
+    return dict(release, schemaVersion=1, size=archive.stat().st_size, sha256=digest)
+
+
+def manifest_bytes(manifest):
+    return (json.dumps(manifest, sort_keys=True, separators=(',', ':')) + '\n').encode()
+
+
 def create(resources, private_key, output):
     resources, output = pathlib.Path(resources), pathlib.Path(output)
     output.mkdir(parents=True, exist_ok=True)
     archive = output / 'helper.zip'
-    digest = pack(resources, archive)
-    release = json.loads((resources / 'update-release.json').read_text())
-    manifest = dict(release, schemaVersion=1, size=archive.stat().st_size,
-                    sha256=digest)
+    pack(resources, archive)
+    manifest = manifest_for(resources, archive)
     path = output / 'manifest.json'
-    path.write_text(json.dumps(manifest, sort_keys=True, separators=(',', ':')) + '\n')
+    path.write_bytes(manifest_bytes(manifest))
     subprocess.run([str(resources / 'PackageSignature'), 'sign', str(private_key), str(path), str(output / 'signature.txt')], check=True)
     subprocess.run([str(resources / 'PackageSignature'), 'verify', str(resources / 'update-public-key.txt'), str(path), str(output / 'signature.txt')], check=True)
     return manifest

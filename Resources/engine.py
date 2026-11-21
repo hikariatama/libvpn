@@ -534,16 +534,45 @@ def ensure_pf_enabled():
 
 def apply_kill_switch(config, tunnel=None, flush=False):
     rules = build_pf_rules(config, tunnel)
+    guarded = protected(config)
     with pf_lock():
         require(run(['/sbin/pfctl', '-n', '-a', PF_ANCHOR, '-f', '-'], rules).returncode == 0, 'PF отклонил конфигурацию')
-        # Disk copy excludes ephemeral TUN names: boot starts with protection closed.
-        write_pf_anchor(build_pf_rules(config).encode())
-        require(run(['/sbin/pfctl', '-a', PF_ANCHOR, '-f', '-'], rules).returncode == 0, 'Не удалось применить PF')
-        if protected(config):
-            ensure_pf_enabled()
-        if flush and protected(config):
+
+        def load_live():
+            require(run(['/sbin/pfctl', '-a', PF_ANCHOR, '-f', '-'], rules).returncode == 0, 'Не удалось применить PF')
+
+        def persist():
+            # Disk copy excludes ephemeral TUN names: boot starts with protection closed.
+            write_pf_anchor(build_pf_rules(config).encode())
+
+        def flush_states():
             # Opting into a system-wide kill switch also invalidates existing direct connections.
             require(run(['/sbin/pfctl', '-F', 'states']).returncode == 0, 'Не удалось закрыть прежние прямые соединения')
+
+        if guarded and tunnel is None:
+            # Tightening must reach the kernel even when disk persistence fails.
+            # A PF-reference marker failure must not skip the required state flush.
+            operations = [load_live, ensure_pf_enabled]
+            if flush:
+                operations.append(flush_states)
+            operations.append(persist)
+            failure = None
+            for operation in operations:
+                try:
+                    operation()
+                except Exception as error:
+                    if failure is None:
+                        failure = error
+            if failure is not None:
+                raise failure
+        else:
+            # Never loosen a ready-TUN guard before its closed boot copy is durable.
+            persist()
+            load_live()
+            if guarded:
+                ensure_pf_enabled()
+            if flush and guarded:
+                flush_states()
 
 
 def publish(state, revision, error=None, tunnel=None):
